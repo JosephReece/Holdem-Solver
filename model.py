@@ -1,5 +1,9 @@
 import tensorflow as tf
 
+model_path = "models/model.keras"
+
+max_sequence_length = 64
+
 vocabulary = [
     # Pad Token
     'PAD',
@@ -32,11 +36,10 @@ vocabulary = [
     'PREFLOP', 'FLOP', 'TURN', 'RIVER'
 ]
 
-# Output tokens
 output_tokens = [
     'FOLD',
     'PASSIVE_ACTION',  # Check or Call
-    'START_AGGRESSIVE_ACTION',  # Bet or Raise
+    'START_AGGRESSIVE_ACTION',  # Begin Bet or Raise (Use OCTAL_X tokens until END_AGGRESSIVE_ACTION)
     'END_AGGRESSIVE_ACTION',
     'ALL_IN',
     'OCTAL_0',
@@ -49,8 +52,20 @@ output_tokens = [
     'OCTAL_7'
 ]
 
+def load_model():
+    return create_model()
+    
+    # try:
+    #     model = tf.keras.models.load_model(model_path)
+    #     return model
+    # except:
+    #     model = create_model()
+    #     return model
+
 def create_model():
-    inputs = tf.keras.layers.Input(shape=(None,), dtype=tf.int32)
+    # inputs = tf.keras.layers.Input(shape=(None,), dtype=tf.int32)
+    
+    inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
     embedding = tf.keras.layers.Embedding(
         input_dim=len(vocabulary),
         output_dim=512
@@ -90,180 +105,192 @@ def create_model():
     
     return model
 
-def encode_game_state(game, player_index):
+def save_model(model):
+    model.save(model_path)
+
+def encode_game_state(game, hero_idx):
     """
-    Encodes the current poker game state into tokens for the transformer model input
+    Encode the current game state using the GTO No-Limit Hold'em Transformer Token Set.
     
-    Args:
-        game: The current poker game instance
-        player_index: Index of the player whose perspective to encode (0 or 1)
+    Parameters:
+        game (PokerGame): The current game state
         
     Returns:
-        list: Array of tokens representing the game state
+        str: A space-separated string of tokens representing the game state
     """
-    
     tokens = []
-    hero = game.players[player_index]
-    villain = game.players[(player_index + 1) % 2]
     
-    # Start sequence
-    tokens.append('BOS')
+    # Start with BOS token
+    tokens.append("BOS")
     
-    # Player position (BTN or BB)
-    tokens.append('BTN' if player_index == 0 else 'BB')
+    # Determine positions
+    opponent_idx = 1 - hero_idx
+    if game.button_player_idx == hero_idx:
+        hero_position = "BTN"
+        opponent_position = "BB"
+    else:
+        hero_position = "BB"
+        opponent_position = "BTN"
     
-    # Hero's cards
-    for card in hero.hand:
-        tokens.append(f"RANK_{card.rank}")
-        tokens.append(f"SUIT_{card.suit[0].upper()}")
+    tokens.append(hero_position)
     
-    # Stack size in octal
-    tokens.append('STACK_SIZE')
-    stack_octal = convert_to_octal(hero.stack)
-    for digit in stack_octal:
+    # Encode hero's cards
+    for card in game.players[hero_idx].hand:
+        # Encode rank
+        rank_map = {
+            '2': 'RANK_2', '3': 'RANK_3', '4': 'RANK_4', '5': 'RANK_5',
+            '6': 'RANK_6', '7': 'RANK_7', '8': 'RANK_8', '9': 'RANK_9',
+            'T': 'RANK_T', 'J': 'RANK_J', 'Q': 'RANK_Q', 'K': 'RANK_K', 'A': 'RANK_A'
+        }
+        
+        suit_map = {
+            'Clubs': 'SUIT_C', 'Diamonds': 'SUIT_D', 'Hearts': 'SUIT_H', 'Spades': 'SUIT_S'
+        }
+        
+        tokens.append(rank_map.get(card.rank))
+        tokens.append(suit_map.get(card.suit))
+
+    # Encode stack size (in octal)
+    hero_stack = game.players[hero_idx].stack
+    tokens.append("STACK_SIZE")
+    octal_stack = oct(hero_stack)[2:]  # Convert to octal string and remove "0o" prefix
+    for digit in octal_stack:
         tokens.append(digit)
     
-    # Group action history by street
-    preflop_actions = [action for action in game.action_history if action.street == 'preflop']
-    flop_actions = [action for action in game.action_history if action.street == 'flop']
-    turn_actions = [action for action in game.action_history if action.street == 'turn']
-    river_actions = [action for action in game.action_history if action.street == 'river']
+    # Encode game history by street
+    if "preflop" in game.history and game.history["preflop"]:
+        tokens.append("PREFLOP")
+        tokens.extend(encode_street_actions(game.history["preflop"], hero_position, opponent_position))
     
-    # Add PREFLOP section with actions
-    tokens.append('PREFLOP')
-    encode_street_actions(preflop_actions, hero, villain, tokens)
-    
-    # If we've reached the flop or beyond
-    if game.street in ['flop', 'turn', 'river', 'showdown']:
-        tokens.append('FLOP')
+    if "flop" in game.history and game.history["flop"]:
+        tokens.append("FLOP")
         
-        # Add pot size at the start of flop
-        tokens.append('POT_SIZE')
-        flop_pot_adjustment = 0 if game.street == 'flop' else get_total_bets_for_street(flop_actions)
-        flop_pot_octal = convert_to_octal(game.pot - flop_pot_adjustment)
-        for digit in flop_pot_octal:
+        # Add pot size (in octal)
+        tokens.append("POT_SIZE")
+        octal_pot = oct(game.pot)[2:]
+        for digit in octal_pot:
             tokens.append(digit)
         
-        # Add flop community cards (first 3)
-        for i in range(min(3, len(game.community_cards))):
-            card = game.community_cards[i]
-            tokens.append(f"RANK_{card.rank}")
-            tokens.append(f"SUIT_{card.suit[0].upper()}")
+        # Add community cards (first 3)
+        if len(game.community_cards) >= 3:
+            for i in range(3):
+                card = game.community_cards[i]
+                card_str = str(card)
+                rank = card_str[0]
+                suit = card_str[1].lower()
+                
+                tokens.append(rank_map.get(card.rank))
+                tokens.append(suit_map.get(card.suit))
         
-        # Add flop actions
-        encode_street_actions(flop_actions, hero, villain, tokens)
+        tokens.extend(encode_street_actions(game.history["flop"], hero_position, opponent_position))
     
-    # If we've reached the turn or beyond
-    if game.street in ['turn', 'river', 'showdown']:
-        tokens.append('TURN')
+    if "turn" in game.history and game.history["turn"]:
+        tokens.append("TURN")
         
-        # Add pot size at the start of turn
-        tokens.append('POT_SIZE')
-        turn_pot_adjustment = 0 if game.street == 'turn' else get_total_bets_for_street(turn_actions)
-        turn_pot_octal = convert_to_octal(game.pot - turn_pot_adjustment)
-        for digit in turn_pot_octal:
+        # Add pot size
+        tokens.append("POT_SIZE")
+        octal_pot = oct(game.pot)[2:]
+        for digit in octal_pot:
             tokens.append(digit)
         
-        # Add turn community card (4th card)
+        # Add turn card
         if len(game.community_cards) >= 4:
             card = game.community_cards[3]
-            tokens.append(f"RANK_{card.rank}")
-            tokens.append(f"SUIT_{card.suit[0].upper()}")
+            card_str = str(card)
+            rank = card_str[0]
+            suit = card_str[1].lower()
+            
+            tokens.append(rank_map.get(card.rank))
+            tokens.append(suit_map.get(card.suit))
         
-        # Add turn actions
-        encode_street_actions(turn_actions, hero, villain, tokens)
+        tokens.extend(encode_street_actions(game.history["turn"], hero_position, opponent_position))
     
-    # If we've reached the river or showdown
-    if game.street in ['river', 'showdown']:
-        tokens.append('RIVER')
+    if "river" in game.history and game.history["river"]:
+        tokens.append("RIVER")
         
-        # Add pot size at the start of river
-        tokens.append('POT_SIZE')
-        river_pot_adjustment = 0 if game.street == 'river' else get_total_bets_for_street(river_actions)
-        river_pot_octal = convert_to_octal(game.pot - river_pot_adjustment)
-        for digit in river_pot_octal:
+        # Add pot size
+        tokens.append("POT_SIZE")
+        octal_pot = oct(game.pot)[2:]
+        for digit in octal_pot:
             tokens.append(digit)
         
-        # Add river community card (5th card)
+        # Add river card
         if len(game.community_cards) >= 5:
             card = game.community_cards[4]
-            tokens.append(f"RANK_{card.rank}")
-            tokens.append(f"SUIT_{card.suit[0].upper()}")
+            card_str = str(card)
+            rank = card_str[0]
+            suit = card_str[1].lower()
+            
+            tokens.append(rank_map.get(card.rank))
+            tokens.append(suit_map.get(card.suit))
         
-        # Add river actions
-        encode_street_actions(river_actions, hero, villain, tokens)
+        tokens.extend(encode_street_actions(game.history["river"], hero_position, opponent_position))
     
-    # End sequence
-    tokens.append('EOS')
+    tokens.append("EOS")
+    
+    # Pad the sequence
+    if len(tokens) > max_sequence_length:
+        tokens = tokens[:max_sequence_length]
+    tokens = tokens + ['PAD'] * (max_sequence_length - len(tokens))
+
+    return " ".join(tokens)
+
+
+def encode_street_actions(actions, hero_position, opponent_position):
+    """Helper function to encode actions for a street."""
+    tokens = []
+    
+    # Filter out RESULT actions and any other non-player actions
+    player_actions = [action for action in actions if not action.startswith("RESULT:")]
+    
+    for action_str in player_actions:
+        # Parse the action string
+        parts = action_str.split(": ")
+        if len(parts) != 2:
+            continue
+        
+        player_name, action = parts
+        position = hero_position if player_name == "Player 1" else opponent_position
+        tokens.append(position)
+        
+        # Extract the action and amount if applicable
+        action_parts = action.split()
+        action_type = action_parts[0].upper()
+        
+        if action_type == "POSTS":
+            # Skip blind postings as they're implied
+            continue
+        elif action_type == "FOLD":
+            tokens.append("FOLD")
+        elif action_type == "CHECK":
+            tokens.append("CHECK")
+        elif action_type == "CALL":
+            tokens.append("CALL")
+        elif action_type == "BET":
+            tokens.append("BET")
+            # Convert amount to octal and add digits
+            if len(action_parts) > 1:
+                amount = int(action_parts[1])
+                octal_amount = oct(amount)[2:]
+                for digit in octal_amount:
+                    tokens.append(digit)
+        elif action_type == "RAISE":
+            tokens.append("RAISE")
+            # Convert amount to octal and add digits
+            if len(action_parts) > 2 and action_parts[1] == "TO":
+                amount = int(action_parts[2])
+                octal_amount = oct(amount)[2:]
+                for digit in octal_amount:
+                    tokens.append(digit)
+        elif action_type == "ALL-IN":
+            tokens.append("ALL_IN")
+            # Extract amount if present
+            if "(" in action and ")" in action:
+                amount_str = action.split("(")[1].split(")")[0]
+                if amount_str.isdigit():
+                    amount = int(amount_str)
+                    octal_amount = oct(amount)[2:]
+                    for digit in octal_amount:
+                        tokens.append(digit)
+    
     return tokens
-
-def encode_street_actions(actions, hero, villain, tokens):
-    """
-    Helper function to encode actions for a specific street
-    
-    Args:
-        actions: List of actions for the street
-        hero: The hero player
-        villain: The villain player
-        tokens: The token list to append to
-    """
-    for action in actions:
-        # Determine if action is from hero or villain
-        is_hero_action = action.player == hero.name
-        # Add position token
-        if is_hero_action:
-            tokens.append('BTN' if 'dealer' in hero.position else 'BB')
-        else:
-            tokens.append('BTN' if 'dealer' in villain.position else 'BB')
-        
-        # Add action type
-        if action.action == 'fold':
-            tokens.append('FOLD')
-        elif action.action == 'check':
-            tokens.append('CHECK')
-        elif action.action == 'call':
-            tokens.append('CALL')
-        elif action.action == 'bet':
-            tokens.append('BET')
-            # Add bet size in octal
-            bet_octal = convert_to_octal(action.amount)
-            for digit in bet_octal:
-                tokens.append(digit)
-        elif action.action == 'raise':
-            tokens.append('RAISE')
-            # Add raise size in octal
-            raise_octal = convert_to_octal(action.amount)
-            for digit in raise_octal:
-                tokens.append(digit)
-        elif action.action == 'all-in':
-            tokens.append('ALL_IN')
-
-def get_total_bets_for_street(actions):
-    """
-    Calculates the total bets made on a specific street
-    
-    Args:
-        actions: List of actions for the street
-        
-    Returns:
-        int: The total amount bet on the street
-    """
-    total = 0
-    for action in actions:
-        if action.action in ['bet', 'raise', 'call', 'all-in']:
-            total += action.amount
-    return total
-
-def convert_to_octal(decimal):
-    """
-    Converts a decimal number to its octal representation as a list of digits
-    
-    Args:
-        decimal: The decimal number to convert
-        
-    Returns:
-        list: The octal digits as strings
-    """
-    
-    octal = oct(decimal)[2:]  # Remove '0o' prefix
-    return list(octal)

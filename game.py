@@ -1,461 +1,659 @@
+import random
 import tensorflow as tf
 import numpy as np
-import copy
+from card import Card, Deck, compare_hands, get_hand_type, hand_ranks
+from model import encode_game_state, load_model, save_model, vocabulary, output_tokens
 
-from card import Card, Deck, compare_hands
-from model import create_model, encode_game_state, vocabulary, output_tokens
-
-save_model = True
-load_model = False
-verbose = True
-model_path = "./models/model.keras"
-
-training_data = []
-model = None
+# Global model for AI decision-making
+global_model = load_model()
 
 class Player:
-    def __init__(self, name, stack, position):
+    def __init__(self, name, stack):
         self.name = name
         self.stack = stack
+        self.reset_hand()
+    
+    def receive_card(self, card):
+        self.hand.append(card)
+    
+    def reset_hand(self):
         self.hand = []
-        self.position = position
-        self.has_acted = False
-        self.has_folded = False
+        self.is_folded = False
         self.current_bet = 0
-
-    def reset_for_hand(self):
-        self.hand = []
-        self.has_acted = False
-        self.has_folded = False
-        self.current_bet = 0
-
 
 class PokerGame:
-    def __init__(self, starting_state=None):
+    def __init__(self, verbose=True):
+        self.deck = None
+        self.community_cards = []
+        self.pot = 0
+        self.current_bet = 0
+        self.button_player_idx = 0  # 0 or 1, representing which player has the dealer button
         self.small_blind = 1
         self.big_blind = 2
-        self.starting_stack = 100
+        self.verbose = verbose  # Flag to control message output
+        
+        # Initialize history to track actions by street
+        self.history = {
+            "preflop": [],
+            "flop": [],
+            "turn": [],
+            "river": []
+        }
+        # Track state-action-reward sequences for training
+        self.training_data = []
+        
+        # Initialize players
+        self.setup_players()
+    
+    def log(self, message):
+        """
+        Print message only if verbose mode is enabled
+        """
+        if self.verbose:
+            print(message)
+    
+    def setup_players(self):
+        self.log("\n===== AI TEXAS HOLD'EM POKER =====")
+        self.log("\nSetting up AI players...")
+        
+        stack_size = 200  # Default stack size
         
         self.players = [
-            Player("Player 1", self.starting_stack, "BTN"),
-            Player("Player 2", self.starting_stack, "BB")
+            Player("AI Player 1", stack_size),
+            Player("AI Player 2", stack_size)
         ]
-        
+        self.log(f"Players created with {stack_size} chips each.")
+    
+    def switch_button(self):
+        self.button_player_idx = 1 - self.button_player_idx
+    
+    def deal_hole_cards(self):
+        # Create a new shuffled deck
         self.deck = Deck()
-        self.deck.shuffle()
         
-        self.community_cards = []
-        self.pot = 0
-        self.current_bet = 0
+        # Deal two cards to each player
+        for _ in range(2):
+            for player in self.players:
+                player.receive_card(self.deck.draw_card())
+    
+    def deal_community_cards(self, count):
+        new_cards = self.deck.draw_cards(count)
+        self.community_cards.extend(new_cards)
+        return new_cards
+    
+    def determine_current_street(self):
+        """
+        Determine the current street based on community cards.
+        Returns: 'preflop', 'flop', 'turn', or 'river'
+        """
+        if not self.community_cards:
+            return "preflop"
+        elif len(self.community_cards) == 3:
+            return "flop"
+        elif len(self.community_cards) == 4:
+            return "turn"
+        else:  # len(self.community_cards) == 5
+            return "river"
+    
+    def record_action(self, street, player_name, action):
+        """
+        Record a player action to the history.
         
-        if starting_state:
-            # Restore game state from history
-            self.street = starting_state["street"]
-            self.community_cards = starting_state["community_cards"]
-            self.pot = starting_state["pot"]
-            self.current_bet = starting_state["current_bet"]
-            self.action_history = starting_state["action_history"]
-            
-            for i, player_state in enumerate(starting_state["players"]):
-                self.players[i].stack = player_state["stack"]
-                self.players[i].hand = player_state["hand"]
-                self.players[i].current_bet = player_state["current_bet"]
-                self.players[i].has_acted = player_state["has_acted"] 
-                self.players[i].has_folded = player_state["has_folded"]
-                
-            self.training_data = starting_state["training_data"]
-        else:
-            self.street = "preflop"
-            self.action_history = []
-            self.training_data = []
-            
-        self.start_hand(self.street)
-
-    def get_game_state(self):
-        return {
-            "street": str(self.street),
-            "deck": Deck([copy.copy(card) for card in self.deck.cards]),
-            "community_cards": [copy.copy(card) for card in self.community_cards],
-            "pot": int(self.pot),
-            "current_bet": int(self.current_bet),
-            "action_history": [copy.copy(action) for action in self.action_history],
-            "training_data": [copy.copy(datum) for datum in self.training_data],
-            "players": [{
-                "stack": int(player.stack),
-                "hand": [copy.copy(card) for card in player.hand],
-                "current_bet": int(player.current_bet),
-                "has_acted": bool(player.has_acted),
-                "has_folded": bool(player.has_folded)
-            } for player in self.players]
-        }
-
-    def start_hand(self, street = "preflop"):
-        if verbose:
-            print("\n=== STARTING HAND ===")
-        self.pot = 0
-        self.current_bet = 0
-        self.community_cards = []
-        self.action_history = []
-
-        for player in self.players:
-            player.reset_for_hand()
-
-        if street == "preflop":
-            self.post_blinds()
-            self.deal_hands()
-            
-            self.run_betting_round()
-            self.street = "flop"
-            
-            game_states = [PokerGame(self.get_game_state()) for i in range(1)]
-            return
+        Parameters:
+            street (str): 'preflop', 'flop', 'turn', or 'river'
+            player_name (str): Name of the player taking the action
+            action (str): Description of the action taken
+        """
+        self.history[street].append(f"{player_name}: {action}")
+    
+    def get_ai_action(self, player_idx):
+        """
+        Get action from the AI model for the player using sampling instead of argmax.
+        """
+        player = self.players[player_idx]
+        opponent = self.players[1 - player_idx]
         
-        if street == "flop":
-            flop = self.deck.draw_cards(3)
-            self.community_cards.extend(flop)
-            
-            if verbose:
-                print("\n=== FLOP ===")
-                print(', '.join(map(str, flop)))
-            
-            self.run_betting_round()
-            self.street = "turn"
-            
-            game_states = [PokerGame(self.get_game_state()) for i in range(1)]
-            return
+        # Calculate how much the player needs to call
+        call_amount = max(0, self.current_bet - player.current_bet)
         
-        if street == "turn":
-            turn = self.deck.draw_card()
-            self.community_cards.append(turn)
-            
-            if verbose:
-                print("\n=== TURN ===")
-                print(turn)
-            
-            self.run_betting_round()
-            self.street = "river"
-            
-            game_states = [PokerGame(self.get_game_state()) for i in range(1)]
-            return
- 
-        if street == "river":
-            river = self.deck.draw_card()
-            self.community_cards.append(river)
-            
-            if verbose:
-                print("\n=== RIVER ===")
-                print(river)
-            
-            self.run_betting_round()
-            self.street = "showdown"
+        # If player has no chips, they can only check or fold
+        if player.stack == 0:
+            action = "check" if call_amount == 0 else "fold"
+            # Determine current street for recording to history
+            street = self.determine_current_street()
+            self.record_action(street, player.name, action)
+            return action
         
-        if verbose:
-            print("\n=== SHOWDOWN ===")
-        self.run_showdown()
-
-    def post_blinds(self):
-        btn, bb = self.players
-        btn.stack -= self.small_blind
-        btn.current_bet = self.small_blind
-        self.pot += self.small_blind
-
-        bb.stack -= self.big_blind
-        bb.current_bet = self.big_blind
-        self.current_bet = self.big_blind
-        self.pot += self.big_blind
-
-        if verbose:
-            print(f"{btn.name} (BTN) posts small blind: ${self.small_blind}")
-            print(f"{bb.name} (BB) posts big blind: ${self.big_blind}")
-
-    def deal_hands(self):
-        for player in self.players:
-            player.hand = self.deck.draw_cards(2)
-            if verbose:
-                print(f"{player.name}'s hand: {', '.join(map(str, player.hand))}")
+        # Encode the current game state
+        encoded_state = encode_game_state(self, player_idx)
+        self.log(f"Encoded state: {encoded_state}")
         
-    def run_betting_round(self):
-        for player in self.players:
-            player.has_acted = False
-
-        current_player_index = 0
-        while not self.check_round_complete():
-            player = self.players[current_player_index]
-            if player.has_folded:
-                break
-
-            if verbose:
-                print(f"{player.name}'s turn (AI decision)...")
-            token = self.get_decision(player)
-            
-            state_tokens = encode_game_state(self, self.players.index(player))
-            self.training_data.append({
-                'state': state_tokens,
-                'decision': token,
-                'player_index': current_player_index
-            })
-            
-            action, amount = None, 0
-            if token == 'FOLD':
-                action = 'fold'
-            elif token == 'PASSIVE_ACTION':
-                if self.current_bet > player.current_bet:
-                    action = 'call'
-                    amount = self.current_bet - player.current_bet
-                else:
-                    action = 'check'
-            elif token == 'START_AGGRESSIVE_ACTION':
-                if self.current_bet > player.current_bet:
-                    action = 'raise'
-                    legal_min = (self.current_bet * 2) - player.current_bet
-                    amount = self.get_aggressive_amount(player, legal_min)
-                else:
-                    action = 'bet'
-                    legal_min = max(int(self.pot * 0.2), 1)
-                    amount = self.get_aggressive_amount(player, legal_min)
-            elif token == 'ALL_IN':
-                action = 'all-in'
-                amount = player.stack
-
-            # Declare hand dead with entire stack if invalid token used (eg OCTAL_4)
-            available_actions = self.get_valid_actions(player)
-            if action not in available_actions:
-                action = "kill"
-            
-            self.process_action(player, action, amount)
-
-            if any(p.has_folded for p in self.players):
-                break
-
-            current_player_index = (current_player_index + 1) % 2
-
-    def get_decision(self, player):
-        tokens = encode_game_state(self, self.players.index(player))
-        token_indices = [vocabulary.index(t) for t in tokens]
-        input_tensor = tf.constant([token_indices])
+        # Store the state for training
+        game_state = encoded_state
         
-        prediction = model(input_tensor)
-        output_probs = prediction.numpy()[0]
+        # Convert encoded state to model input
+        # This would involve tokenizing the string and converting to tensor
+        token_to_id = {token: i for i, token in enumerate(vocabulary)}
+        tokenized_input = [token_to_id.get(token, 0) for token in encoded_state.split()]
+        model_input = tf.expand_dims(tf.constant(tokenized_input), 0)
         
-        return output_tokens[output_probs.argmax()]
-
-    def get_aggressive_amount(self, player, default_min):
-        digits = []
-        max_chips = player.stack
-        while True:
-            tokens = encode_game_state(self, self.players.index(player)) + ["SDM"] + digits
-            token_indices = [vocabulary.index(t) for t in tokens]
-            input_tensor = tf.constant([token_indices])
-            prediction = model(input_tensor)
-            output_probs = prediction.numpy()[0]
-            next_token = output_tokens[output_probs.argmax()]
-
-            if next_token == "STOP_AGGRESSIVE_ACTION":
-                break
-            elif next_token in ['OCTAL_0', 'OCTAL_1', 'OCTAL_2', 'OCTAL_3', 'OCTAL_4', 'OCTAL_5', 'OCTAL_6', 'OCTAL_7']:
-                digits.append(next_token)
-                candidate = int("".join(digits), 8)
-                if candidate > max_chips:
-                    return max_chips
+        # Get prediction from model
+        prediction = global_model.predict(model_input, verbose=0)[0]
+        
+        # Sample from the prediction probability distribution instead of argmax
+        # Add a small constant to ensure no probability is exactly zero
+        prediction = np.array(prediction) + 1e-8
+        prediction = prediction / np.sum(prediction)  # Normalize to ensure sum = 1
+        action_idx = np.random.choice(len(prediction), p=prediction)
+        action_token = output_tokens[action_idx]
+        
+        # Determine current street for recording to history
+        street = self.determine_current_street()
+        
+        # Convert model output to concrete action
+        if action_token == 'FOLD':
+            player.is_folded = True
+            self.record_action(street, player.name, "fold")
+            action_str = "fold"
+            self.log(f"{player.name} folds")
+        
+        elif action_token == 'PASSIVE_ACTION':
+            if call_amount == 0:
+                self.record_action(street, player.name, "check")
+                action_str = "check"
+                self.log(f"{player.name} checks")
             else:
-                break
-
-        final_amount = int("".join(digits), 8) if digits else 0
-        return max(default_min, min(final_amount, max_chips))
-
-    def get_valid_actions(self, player):
-        actions = []
-        diff = self.current_bet - player.current_bet
-        if diff > 0:
-            actions.append("fold")
-            if player.stack >= diff:
-                actions.append("call")
-            if player.stack >= diff * 2:
-                actions.append("raise")
-        else:
-            actions.append("check")
-            if player.stack > 0:
-                actions.append("bet")
-        if player.stack > 0:
-            actions.append("all-in")
-        return actions
-
-    def process_action(self, player, action, amount):
-        # Store the game state and action for training
-        state_tokens = encode_game_state(self, self.players.index(player))
+                # Call logic
+                if player.stack <= call_amount:  # Call is actually all-in
+                    self.pot += player.stack
+                    self.current_bet = opponent.current_bet
+                    player.current_bet = player.current_bet + player.stack
+                    player.stack = 0
+                    action_str = f"call {player.stack} (all-in)"
+                    self.record_action(street, player.name, action_str)
+                    self.log(f"{player.name} calls {player.stack} (all-in)")
+                else:
+                    self.pot += call_amount
+                    player.stack -= call_amount
+                    player.current_bet = self.current_bet
+                    action_str = f"call {call_amount}"
+                    self.record_action(street, player.name, action_str)
+                    self.log(f"{player.name} calls {call_amount}")
         
-        player.has_acted = True
-        if action == "fold":
-            player.has_folded = True
-        elif action == "kill": # Fold hand and forfeit entire stack
-            player.has_folded = True
+        elif action_token == 'START_AGGRESSIVE_ACTION':
+            # Look for octal digits until END_AGGRESSIVE_ACTION
+            # For simplicity, let's use a random amount between 1/4 and 3/4 of the stack
+            min_bet = self.big_blind
+            if call_amount > 0:  # Raising
+                min_bet = self.current_bet + self.big_blind
+                
+            max_bet = min(player.stack, self.current_bet + player.stack)
+            bet_amount = random.randint(max(min_bet, player.stack // 4), 
+                                        max(min_bet, min(player.stack * 3 // 4, max_bet)))
+            
+            if self.current_bet == 0:  # Betting
+                self.pot += bet_amount
+                player.stack -= bet_amount
+                self.current_bet = bet_amount
+                player.current_bet = bet_amount
+                action_str = f"bet {bet_amount}"
+                self.record_action(street, player.name, action_str)
+                self.log(f"{player.name} bets {bet_amount}")
+            else:  # Raising
+                # Calculate how much more the player needs to put in
+                additional_amount = bet_amount - player.current_bet
+                self.pot += additional_amount
+                player.stack -= additional_amount
+                self.current_bet = bet_amount
+                player.current_bet = bet_amount
+                action_str = f"raise to {bet_amount}"
+                self.record_action(street, player.name, action_str)
+                self.log(f"{player.name} raises to {bet_amount}")
+        
+        elif action_token == 'ALL_IN':
+            total_bet = player.current_bet + player.stack
             self.pot += player.stack
+            if total_bet > self.current_bet:
+                self.current_bet = total_bet
+            player.current_bet = total_bet
             player.stack = 0
-        elif action in ["call", "bet", "raise", "all-in"]:
-            player.stack -= amount
-            player.current_bet += amount
-            self.pot += amount
-            if player.current_bet > self.current_bet:
-                self.current_bet = player.current_bet
-                for p in self.players:
-                    if p != player:
-                        p.has_acted = False
-        if verbose:
-            print(f"{player.name} {action}s ${amount}. Pot: ${self.pot}")
-
-    def check_round_complete(self):
-        active = [p for p in self.players if not p.has_folded]
-        return len(active) == 1 or all(p.has_acted and (p.current_bet == self.current_bet or p.stack == 0) for p in active)
-
-    def run_showdown(self):
-        active = [p for p in self.players if not p.has_folded]
-        winner = None
+            action_str = f"all-in ({total_bet})"
+            self.record_action(street, player.name, action_str)
+            self.log(f"{player.name} goes all-in ({total_bet})")
         
-        if len(active) == 1:
-            winner = active[0]
-            winner.stack += self.pot
-            winner_index = self.players.index(winner)
-
-            for data in self.training_data:
-                if winner_index == data["player_index"]:
-                    training_data.append({
-                        'state': data['state'],
-                        'decision': data['decision'],
-                        'amount': self.pot // 2
-                    })
-                    
-                    print("State: " + data['state'])
-                    print("Decision: " + data['decision'])
-                    print("Amount: " + str(self.pot // 2))
-                else:
-                    training_data.append({
-                        'state': data['state'],
-                        'decision': data['decision'],
-                        'amount': -(self.pot // 2)
-                    })
-                    
-                    print("State: " + str(data['state']))
-                    print("Decision: " + str(data['decision']))
-                    print("Amount: " + str(-self.pot // 2))
-
-            if verbose:
-                print(f"{winner.name} wins ${self.pot} uncontested.")
         else:
-            winner_name = compare_hands(active[0].hand + self.community_cards, active[1].hand + self.community_cards)
-            
-            if winner_name == "Tie":
-                player[0] += self.pot // 2
-                player[1] += self.pot // 2
-                
-                for data in self.training_data:
-                    training_data.append({
-                        'state': data['state'],
-                        'decision': data['decision'],
-                        'amount': 0
-                    })
-                    
-                if verbose:
-                    print(f"Both players tie")
+            # Default to a safe action if something goes wrong
+            if call_amount == 0:
+                self.record_action(street, player.name, "check")
+                action_str = "check"
+                self.log(f"{player.name} checks (default action)")
             else:
-                winner = next(p for p in active if p.name == winner_name)
-                winner.stack += self.pot
-                winner_index = self.players.index(winner)
+                player.is_folded = True
+                self.record_action(street, player.name, "fold")
+                action_str = "fold"
+                self.log(f"{player.name} folds (default action)")
+        
+        # Add this state-action pair to training data (reward will be determined at end of hand)
+        self.training_data.append({
+            'player_idx': player_idx,
+            'state': game_state,
+            'action': action_token,
+            'stack_before': player.stack + (0 if 'call' not in action_str and 'bet' not in action_str and 'raise' not in action_str and 'all-in' not in action_str else int(action_str.split()[-1].strip('()').strip('all-in'))),
+            'reward': None  # Will be filled in later
+        })
+        
+        return action_str
+    
+    def betting_round(self, first_player_idx):
+        """
+        Run a betting round
+        first_player_idx: Index of the player who acts first (0 or 1)
+        Returns: Whether the hand is over (True if only one player left)
+        """
+        player_idx = first_player_idx
+        players_acted = 0
+        players_all_in = sum(1 for p in self.players if p.stack == 0)
+        active_players = sum(1 for p in self.players if not p.is_folded)
+        
+        # If all active players are all-in, no betting needed
+        if players_all_in == active_players:
+            return active_players < 2
+        
+        # Reset current bet for the new round (if not preflop)
+        if self.community_cards:
+            self.current_bet = 0
+            for player in self.players:
+                player.current_bet = 0
+        
+        # Last raise amount (used for min-raise calculations)
+        last_raise = 0
+        
+        while True:
+            # Skip folded players
+            if self.players[player_idx].is_folded:
+                player_idx = 1 - player_idx
+                continue
             
-                for data in self.training_data:
-                    if winner_index == data["player_index"]:
-                        training_data.append({
-                            'state': data['state'],
-                            'decision': data['decision'],
-                            'amount': self.pot // 2
-                        })
-                    else:
-                        training_data.append({
-                            'state': data['state'],
-                            'decision': data['decision'],
-                            'amount': -(self.pot // 2)
-                        })
+            # Skip all-in players
+            if self.players[player_idx].stack == 0:
+                player_idx = 1 - player_idx
+                players_acted += 1
+                if players_acted >= active_players:
+                    break
+                continue
+                
+            # Get action from the AI player
+            action = self.get_ai_action(player_idx)
             
-                if verbose:
-                    print(f"{winner} wins ${self.pot}.")    
+            # Process the action
+            if "fold" in action:
+                # Check if only one player left
+                if sum(not p.is_folded for p in self.players) == 1:
+                    return True
             
+            elif "raise" in action or "bet" in action:
+                # Update the last raise amount
+                new_bet = self.players[player_idx].current_bet
+                prev_bet = self.players[1 - player_idx].current_bet if "raise" in action else 0
+                last_raise = new_bet - prev_bet
+                
+                # Reset players_acted to ensure the other player gets to act
+                players_acted = 0
+            
+            player_idx = 1 - player_idx
+            players_acted += 1
+            
+            # Check if betting round is complete
+            if players_acted >= active_players and self.players[0].current_bet == self.players[1].current_bet:
+                break
+        
+        return False
+    
+    def determine_winner(self):
+        # Check if only one player is left (not folded)
+        active_players = [p for p in self.players if not p.is_folded]
+        if len(active_players) == 1:
+            return active_players[0]
+        
+        # Compare hands for showdown
+        hands = []
+        for player in self.players:
+            if not player.is_folded:
+                best_hand = player.hand + self.community_cards
+                hand_type = get_hand_type(best_hand)
+                hands.append((player, best_hand, hand_type))
+        
+        # Show the showdown information
+        self.log("\n=== SHOWDOWN ===")
+        for player, hand, hand_type in hands:
+            self.log(f"{player.name}: {[str(card) for card in player.hand]} - {hand_type}")
+        self.log(f"Community cards: {[str(card) for card in self.community_cards]}")
+        
+        if len(hands) == 2:
+            # Use compare_hands function to determine the winner
+            result = compare_hands(hands[0][1], hands[1][1])
+            if result == "Player 1":
+                return hands[0][0]  # Player object
+            elif result == "Player 2":
+                return hands[1][0]  # Player object
+            else:  # Tie
+                return None
+        
+        return None  # Shouldn't happen in heads-up
+    
+    def display_hand_history(self):
+        """
+        Display the complete history of actions for the current hand.
+        """
+        self.log("\n=== HAND HISTORY ===")
+        
+        for street in ["preflop", "flop", "turn", "river"]:
+            actions = self.history[street]
+            if actions:
+                self.log(f"--- {street.upper()} ---")
+                for action in actions:
+                    self.log(action)
+        
+        self.log("===================\n")
+    
+    def compute_rewards(self, winner):
+        """
+        Compute rewards for all decisions made in the hand.
+        This uses a simplified reward system where winning = positive reward,
+        losing = negative reward, with the magnitude based on pot size.
+        """
+        if winner is None:
+            # Split pot - small positive reward for both
+            for data in self.training_data:
+                data['reward'] = self.pot / 4  # Small positive reward for tie
+        else:
+            winner_idx = self.players.index(winner)
+            for data in self.training_data:
+                # Decisions by winner get positive reward proportional to pot size
+                if data['player_idx'] == winner_idx:
+                    data['reward'] = self.pot / 2
+                else:
+                    # Decisions by loser get negative reward proportional to pot size
+                    data['reward'] = -self.pot / 2
+    
+    def play_hand(self):
+        # Reset for new hand
+        self.pot = 0
+        self.current_bet = 0
+        self.community_cards = []
+        for player in self.players:
+            player.reset_hand()
+        
+        # Reset history for new hand
+        self.history = {
+            "preflop": [],
+            "flop": [],
+            "turn": [],
+            "river": []
+        }
+        
+        # Reset training data for new hand
+        self.training_data = []
+        
+        # Determine positions
+        button_idx = self.button_player_idx
+        sb_idx = button_idx  # In heads-up, button is also SB
+        bb_idx = 1 - button_idx
+        
+        self.log("\n" + "="*50)
+        self.log(f"NEW HAND - {self.players[0].name}: {self.players[0].stack} chips, {self.players[1].name}: {self.players[1].stack} chips")
+        self.log(f"{self.players[button_idx].name} has the button (small blind)")
+        
+        # Post blinds
+        sb_amount = min(self.small_blind, self.players[sb_idx].stack)
+        bb_amount = min(self.big_blind, self.players[bb_idx].stack)
+        
+        self.players[sb_idx].stack -= sb_amount
+        self.players[sb_idx].current_bet = sb_amount
+        self.players[bb_idx].stack -= bb_amount
+        self.players[bb_idx].current_bet = bb_amount
+        
+        self.pot = sb_amount + bb_amount
+        self.current_bet = bb_amount
+        
+        self.log(f"{self.players[sb_idx].name} posts small blind: {sb_amount}")
+        self.log(f"{self.players[bb_idx].name} posts big blind: {bb_amount}")
+        
+        # Record blinds in history
+        self.record_action("preflop", self.players[sb_idx].name, f"posts small blind {sb_amount}")
+        self.record_action("preflop", self.players[bb_idx].name, f"posts big blind {bb_amount}")
+        
+        # Deal hole cards
+        self.deal_hole_cards()
+        
+        # Show hole cards 
+        for i, player in enumerate(self.players):
+            self.log(f"\n{player.name} cards: {[str(card) for card in player.hand]}")
+        
+        # Pre-flop betting (SB acts first in heads-up)
+        self.log("\n--- PRE-FLOP ---")
+        if self.betting_round(sb_idx):
+            # Hand is over - only one player left
+            winner = self.determine_winner()
+            self.compute_rewards(winner)
+            self.award_pot(winner)
+            self.display_hand_history()
+            self.switch_button()
+            return self.training_data
+        
+        # Flop
+        self.log("\n--- FLOP ---")
+        flop_cards = self.deal_community_cards(3)
+        self.log(f"Flop: {[str(card) for card in flop_cards]}")
+        
+        # Flop betting (BB acts first)
+        if self.betting_round(bb_idx):
+            winner = self.determine_winner()
+            self.compute_rewards(winner)
+            self.award_pot(winner)
+            self.display_hand_history()
+            self.switch_button()
+            return self.training_data
+        
+        # Turn
+        self.log("\n--- TURN ---")
+        turn_card = self.deal_community_cards(1)
+        self.log(f"Turn: {[str(card) for card in turn_card]}")
+        
+        # Turn betting (BB acts first)
+        if self.betting_round(bb_idx):
+            winner = self.determine_winner()
+            self.compute_rewards(winner)
+            self.award_pot(winner)
+            self.display_hand_history()
+            self.switch_button()
+            return self.training_data
+        
+        # River
+        self.log("\n--- RIVER ---")
+        river_card = self.deal_community_cards(1)
+        self.log(f"River: {[str(card) for card in river_card]}")
+        
+        # River betting (BB acts first)
+        if self.betting_round(bb_idx):
+            winner = self.determine_winner()
+            self.compute_rewards(winner)
+            self.award_pot(winner)
+            self.display_hand_history()
+            self.switch_button()
+            return self.training_data
+        
+        # Showdown
+        winner = self.determine_winner()
+        self.compute_rewards(winner)
+        self.award_pot(winner)
+        self.display_hand_history()
+        self.switch_button()
+        return self.training_data
+    
+    def award_pot(self, winner):
+        if winner is None:
+            # Split pot
+            split_amount = self.pot // 2
+            remainder = self.pot % 2
+            
+            self.players[0].stack += split_amount
+            self.players[1].stack += split_amount
+            
+            # Give the odd chip to the button player
+            if remainder:
+                self.players[self.button_player_idx].stack += remainder
+            
+            self.log(f"\nTie game! Pot ({self.pot}) is split.")
+            # Record the result in history
+            street = self.determine_current_street()
+            self.record_action(street, "RESULT", f"Pot ({self.pot}) split between players")
+        else:
+            winner.stack += self.pot
+            self.log(f"\n{winner.name} wins pot of {self.pot} chips!")
+            # Record the result in history
+            street = self.determine_current_street()
+            self.record_action(street, "RESULT", f"{winner.name} wins pot of {self.pot} chips")
+    
+    def play_game(self, num_hands=10, training=False):
+        self.log(f"\nAI poker simulation starting with {num_hands} hands...")
+        
+        all_training_data = []
+        
+        for hand_num in range(1, num_hands + 1):
+            self.log(f"\nPlaying hand {hand_num} of {num_hands}")
+            
+            if self.players[0].stack <= 0:
+                self.log(f"\n{self.players[1].name} wins the game!")
+                break
+            elif self.players[1].stack <= 0:
+                self.log(f"\n{self.players[0].name} wins the game!")
+                break
+            
+            # Play the hand and get training data
+            hand_data = self.play_hand()
+            
+            if training:
+                all_training_data.extend(hand_data)
+        
+        self.log("\nFinal chip counts:")
+        for player in self.players:
+            self.log(f"{player.name}: {player.stack} chips")
+        self.log("\nAI poker simulation complete!")
+        
+        return all_training_data
 
-def train_batch(self):
-    if not self.training_data:
-        return
+def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.001):
+    """
+    Train the global model using reinforcement learning on self-play games.
     
-    # Prepare training data
-    states = []
-    labels = []
+    Parameters:
+        epochs (int): Number of training epochs
+        hands_per_epoch (int): Number of hands to play in each epoch
+        batch_size (int): Batch size for model training
+        learning_rate (float): Learning rate for optimizer
+    """
+    print("Starting model training...")
     
-    # Find maximum sequence length
-    max_len = max(len(data['state']) for data in self.training_data)
+    # Compile the model with an appropriate optimizer and loss function
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    global_model.compile(optimizer=optimizer, 
+                        loss='sparse_categorical_crossentropy',
+                        metrics=['accuracy'])
     
-    for data in self.training_data:
-        # Filter out losing actions
-        if data["amount"] < 0:
+    # Token mappings
+    token_to_id = {token: i for i, token in enumerate(vocabulary)}
+    action_to_id = {action: i for i, action in enumerate(output_tokens)}
+    
+    # For tracking progress
+    avg_rewards = []
+    
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs}")
+        
+        training_data = []
+        for hand in range(hands_per_epoch):
+            # Play games to collect training data
+            game = PokerGame(verbose=True)
+            training_data += game.play_game(num_hands=1, training=True)
+        
+        if not training_data:
+            print("No training data collected in this epoch.")
             continue
         
-        # Pad sequences with a special PAD token index (using 0)
-        padded_state = [vocabulary.index(t) for t in data['state']]
-        padded_state.extend([0] * (max_len - len(padded_state)))
-        states.append(padded_state)
+        # Process training data
+        states = []
+        actions = []
+        rewards = []
         
-        # Create sparse categorical labe
-        if data['stack_change'] > 0:  # Winning outcome
-            if data['action'] in ['bet', 'raise']:
-                label = output_tokens.index('START_AGGRESSIVE_ACTION')
-            elif data['action'] in ['check', 'call']:
-                label = output_tokens.index('PASSIVE_ACTION')
-            else:
-                label = output_tokens.index('ALL_IN')
-        else:  # Losing outcome
-            label = output_tokens.index('FOLD')
+        for data_point in training_data:
+            # Skip if no reward was assigned (shouldn't happen but just in case)
+            if data_point['reward'] is None:
+                continue
+                
+            # Process state
+            state_tokens = [token_to_id.get(token, 0) for token in data_point['state'].split()]
+                
+            # Get action ID
+            action_id = action_to_id.get(data_point['action'], 0)
+            
+            # Append to lists
+            states.append(state_tokens)
+            actions.append(action_id)
+            rewards.append(data_point['reward'])
         
-        labels.append(label)
-    
-    # Convert to tensors
-    states = tf.convert_to_tensor(states, dtype=tf.int32)
-    labels = tf.convert_to_tensor(labels, dtype=tf.int32)  # Changed to int32
-    
-    # Train the model
-    if verbose:
-        print("Training model with batch data...")
-    model.fit(states, labels, epochs=1, verbose=2)
-    
-    if save_model:
-        model.save(model_path)
+        # Convert to numpy arrays
+        states = np.array(states)
+        actions = np.array(actions)
+        rewards = np.array(rewards)
         
-        if verbose:
-            print("Model saved successfully")
+        # Normalize rewards
+        if len(rewards) > 0:
+            rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-8)
+            avg_rewards.append(np.mean(rewards))
+        
+        # Train in batches
+        num_samples = len(states)
+        indices = np.arange(num_samples)
+        np.random.shuffle(indices)
+        
+        for start_idx in range(0, num_samples, batch_size):
+            end_idx = min(start_idx + batch_size, num_samples)
+            batch_indices = indices[start_idx:end_idx]
+            
+            batch_states = states[batch_indices]
+            batch_actions = actions[batch_indices]
+            batch_rewards = rewards[batch_indices]
+            
+            # Custom training step with rewards as sample weights
+            global_model.fit(
+                batch_states,
+                batch_actions,
+                sample_weight=batch_rewards,
+                epochs=1,
+                verbose=0
+            )
+        
+        print(f"Epoch {epoch+1} complete. Average reward: {np.mean(avg_rewards[-1] if avg_rewards else 0):.4f}")
     
-    # Clear training data
-    self.training_data = []
+    print("\nTraining complete!")
+    save_model(global_model)
+    print("Model saved")
 
-def initialize_model():
-        if verbose:
-            print("Initializing AI model...")
-        
-        if load_model:
-            return tf.keras.models.load_model(model_path)
-            if verbose:
-                print("Loaded existing model successfully")
-        else:
-            return create_model()
-            if verbose:
-                print("Created new model successfully")
-
+# Start the game and training
 if __name__ == "__main__":
-    model = initialize_model()
-    print(model)
+    print("Initializing AI model...")
     
-    # Play 100 new starting-stack games
-    for i in range(1):
-        print(f"\nPlaying game {i+1}/100")
-        game = PokerGame()
-        
-        if (i + 1) % 10 == 0:  # Train every 10 games
-            if game.verbose:
-                print("Training model with batch data...")
-            game.train_batch()
+    # First play without training to establish a baseline
+    print("\n=== BASELINE PERFORMANCE (BEFORE TRAINING) ===")
+    game = PokerGame(verbose=True)
+    game.play_game(num_hands=1)
     
-    print("Completed training session")
+    # Now train the model
+    print("\n=== STARTING MODEL TRAINING ===")
+    train_model(epochs=3, hands_per_epoch=10, batch_size=16)
+    
+    # Test the trained model
+    print("\n=== EVALUATING TRAINED MODEL ===")
+    game = PokerGame(verbose=True)
+    game.play_game(num_hands=3)

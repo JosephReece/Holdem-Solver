@@ -1,6 +1,7 @@
 import random
 
 rank_order = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
+suits = ['Hearts', 'Spades', 'Clubs', 'Diamonds']
 
 hand_ranks = {
     'High Card': 1,
@@ -23,20 +24,15 @@ class Card:
         return f"{self.rank} of {self.suit}"
 
 class Deck:
-    def __init__(self, cards = None):
-        self.suits = ['Hearts', 'Diamonds', 'Clubs', 'Spades']
-        self.ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
-        self.initialize_deck(cards)
+    def __init__(self):
+        self.initialize_deck()
         self.shuffle()
     
-    def initialize_deck(self, cards):
-        if cards:
-            self.cards = cards
-        else:
-            self.cards = []
-            for suit in self.suits:
-                for rank in self.ranks:
-                    self.cards.append(Card(rank, suit))
+    def initialize_deck(self):
+        self.cards = []
+        for suit in suits:
+            for rank in rank_order:
+                self.cards.append(Card(rank, suit))
     
     def shuffle(self):
         random.shuffle(self.cards)
@@ -319,4 +315,3 @@ def compare_hands(hand1, hand2):
     best_hand2 = find_best_hand(combinations2)
     
     return compare_5_card_hands(best_hand1, best_hand2)
-
