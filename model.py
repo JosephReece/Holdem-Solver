@@ -2,7 +2,7 @@ import tensorflow as tf
 
 model_path = "models/model.keras"
 
-max_sequence_length = 64
+max_sequence_length = 256
 
 vocabulary = [
     # Pad Token
@@ -108,15 +108,19 @@ def create_model():
 def save_model(model):
     model.save(model_path)
 
+def card_as_tokens(card):
+    return ["RANK_" + card.rank, "SUIT_" + card.suit[0]]
+
+def amount_as_tokens(amount):
+    tokens = []
+    octal_amount = oct(amount)[2:]
+    for digit in octal_amount:
+        tokens.append(digit)
+    return tokens        
+    
 def encode_game_state(game, hero_idx):
     """
-    Encode the current game state using the GTO No-Limit Hold'em Transformer Token Set.
-    
-    Parameters:
-        game (PokerGame): The current game state
-        
-    Returns:
-        str: A space-separated string of tokens representing the game state
+    Encode the current game state using the Token Set.
     """
     tokens = []
     
@@ -136,96 +140,29 @@ def encode_game_state(game, hero_idx):
     
     # Encode hero's cards
     for card in game.players[hero_idx].hand:
-        # Encode rank
-        rank_map = {
-            '2': 'RANK_2', '3': 'RANK_3', '4': 'RANK_4', '5': 'RANK_5',
-            '6': 'RANK_6', '7': 'RANK_7', '8': 'RANK_8', '9': 'RANK_9',
-            'T': 'RANK_T', 'J': 'RANK_J', 'Q': 'RANK_Q', 'K': 'RANK_K', 'A': 'RANK_A'
-        }
-        
-        suit_map = {
-            'Clubs': 'SUIT_C', 'Diamonds': 'SUIT_D', 'Hearts': 'SUIT_H', 'Spades': 'SUIT_S'
-        }
-        
-        tokens.append(rank_map.get(card.rank))
-        tokens.append(suit_map.get(card.suit))
+        tokens.extend(card_as_tokens(card))
 
     # Encode stack size (in octal)
-    hero_stack = game.players[hero_idx].stack
     tokens.append("STACK_SIZE")
-    octal_stack = oct(hero_stack)[2:]  # Convert to octal string and remove "0o" prefix
-    for digit in octal_stack:
-        tokens.append(digit)
+    hero_stack = game.players[hero_idx].stack
+    tokens.extend(amount_as_tokens(hero_stack))
     
-    # Encode game history by street
-    if "preflop" in game.history and game.history["preflop"]:
-        tokens.append("PREFLOP")
-        tokens.extend(encode_street_actions(game.history["preflop"], hero_position, opponent_position))
-    
-    if "flop" in game.history and game.history["flop"]:
-        tokens.append("FLOP")
+    street_cards = [0, 3, 1, 1]
+    for i, (street, street_actions) in enumerate(game.history.items()):
+        if len(street_actions) == 0:
+            continue
         
-        # Add pot size (in octal)
-        tokens.append("POT_SIZE")
-        octal_pot = oct(game.pot)[2:]
-        for digit in octal_pot:
-            tokens.append(digit)
+        tokens.append(street.upper())
         
-        # Add community cards (first 3)
-        if len(game.community_cards) >= 3:
-            for i in range(3):
-                card = game.community_cards[i]
-                card_str = str(card)
-                rank = card_str[0]
-                suit = card_str[1].lower()
-                
-                tokens.append(rank_map.get(card.rank))
-                tokens.append(suit_map.get(card.suit))
+        if street != "preflop":
+            tokens.append("POT_SIZE")
+            tokens.extend(amount_as_tokens(game.pot))
         
-        tokens.extend(encode_street_actions(game.history["flop"], hero_position, opponent_position))
-    
-    if "turn" in game.history and game.history["turn"]:
-        tokens.append("TURN")
+        for j in range(street_cards[i]):
+            tokens.extend(card_as_tokens(game.community_cards[j]))
         
-        # Add pot size
-        tokens.append("POT_SIZE")
-        octal_pot = oct(game.pot)[2:]
-        for digit in octal_pot:
-            tokens.append(digit)
+        tokens.extend(encode_street_actions(street_actions, hero_idx, hero_position, opponent_position))
         
-        # Add turn card
-        if len(game.community_cards) >= 4:
-            card = game.community_cards[3]
-            card_str = str(card)
-            rank = card_str[0]
-            suit = card_str[1].lower()
-            
-            tokens.append(rank_map.get(card.rank))
-            tokens.append(suit_map.get(card.suit))
-        
-        tokens.extend(encode_street_actions(game.history["turn"], hero_position, opponent_position))
-    
-    if "river" in game.history and game.history["river"]:
-        tokens.append("RIVER")
-        
-        # Add pot size
-        tokens.append("POT_SIZE")
-        octal_pot = oct(game.pot)[2:]
-        for digit in octal_pot:
-            tokens.append(digit)
-        
-        # Add river card
-        if len(game.community_cards) >= 5:
-            card = game.community_cards[4]
-            card_str = str(card)
-            rank = card_str[0]
-            suit = card_str[1].lower()
-            
-            tokens.append(rank_map.get(card.rank))
-            tokens.append(suit_map.get(card.suit))
-        
-        tokens.extend(encode_street_actions(game.history["river"], hero_position, opponent_position))
-    
     tokens.append("EOS")
     
     # Pad the sequence
@@ -236,61 +173,20 @@ def encode_game_state(game, hero_idx):
     return " ".join(tokens)
 
 
-def encode_street_actions(actions, hero_position, opponent_position):
+def encode_street_actions(actions, hero_idx, hero_position, opponent_position):
     """Helper function to encode actions for a street."""
     tokens = []
     
-    # Filter out RESULT actions and any other non-player actions
-    player_actions = [action for action in actions if not action.startswith("RESULT:")]
-    
-    for action_str in player_actions:
-        # Parse the action string
-        parts = action_str.split(": ")
-        if len(parts) != 2:
-            continue
-        
-        player_name, action = parts
-        position = hero_position if player_name == "Player 1" else opponent_position
+    for action in actions:
+        position = hero_position if action["player_idx"] == hero_idx else opponent_position
         tokens.append(position)
         
-        # Extract the action and amount if applicable
-        action_parts = action.split()
-        action_type = action_parts[0].upper()
-        
-        if action_type == "POSTS":
-            # Skip blind postings as they're implied
+        action_type = action["action"]
+        if action_type == "POST":
             continue
-        elif action_type == "FOLD":
-            tokens.append("FOLD")
-        elif action_type == "CHECK":
-            tokens.append("CHECK")
-        elif action_type == "CALL":
-            tokens.append("CALL")
-        elif action_type == "BET":
-            tokens.append("BET")
-            # Convert amount to octal and add digits
-            if len(action_parts) > 1:
-                amount = int(action_parts[1])
-                octal_amount = oct(amount)[2:]
-                for digit in octal_amount:
-                    tokens.append(digit)
-        elif action_type == "RAISE":
-            tokens.append("RAISE")
-            # Convert amount to octal and add digits
-            if len(action_parts) > 2 and action_parts[1] == "TO":
-                amount = int(action_parts[2])
-                octal_amount = oct(amount)[2:]
-                for digit in octal_amount:
-                    tokens.append(digit)
-        elif action_type == "ALL-IN":
-            tokens.append("ALL_IN")
-            # Extract amount if present
-            if "(" in action and ")" in action:
-                amount_str = action.split("(")[1].split(")")[0]
-                if amount_str.isdigit():
-                    amount = int(amount_str)
-                    octal_amount = oct(amount)[2:]
-                    for digit in octal_amount:
-                        tokens.append(digit)
+        else:
+            tokens.append(action_type)
+            if action_type in ["BET", "RAISE", "ALL_IN"]:
+                tokens.extend(amount_as_tokens(action["amount"]))
     
     return tokens
