@@ -1,3 +1,4 @@
+import time
 import random
 import tensorflow as tf
 import numpy as np
@@ -6,6 +7,9 @@ from model import encode_game_state, load_model, save_model, vocabulary, output_
 
 # Global model for AI decision-making
 global_model = load_model()
+
+# Human-Readable tokens for printing
+shorthand_output_tokens = ['Fold', 'Check/Call', 'Start Bet/Raise', 'End Bet/Raise', '0', '1', '2', '3', '4', '5', '6', '7']
 
 class Player:
     def __init__(self, name, stack):
@@ -148,8 +152,15 @@ class PokerGame:
             prediction = global_model.predict(model_input, verbose=0)[0]
             
             # Sample from the prediction probability distribution
-            prediction = np.array(prediction) + 0.1 # + 1e-8
+            prediction = np.array(prediction) + 0.01 # + 1e-8
             prediction = prediction / np.sum(prediction)  # Normalize to ensure sum = 1
+            
+            # Print predicted probabilities for each action
+            formatted_probs = []
+            for i, (prob, token) in enumerate(zip(prediction, shorthand_output_tokens)):
+                formatted_probs.append(f"{token} ({prob:.4f})")
+            self.log(" • ".join(formatted_probs))
+                
             action_idx = np.random.choice(len(prediction), p=prediction)
             action_token = output_tokens[action_idx]
             
@@ -177,14 +188,13 @@ class PokerGame:
                 return "fold"
         
         # Add initial action to training data
-        if action_token != 'START_AGGRESSIVE_ACTION':
-            self.training_data.append({
-                'player_idx': player_idx,
-                'state': game_state,
-                'action': action_token,
-                'stack_before': player.stack,
-                'reward': None  # Will be filled in later
-            })
+        self.training_data.append({
+            'player_idx': player_idx,
+            'state': game_state,
+            'action': action_token,
+            'stack_before': player.stack,
+            'reward': None  # Will be filled in later
+        })
         
         # Process the action based on the token
         if action_token == 'FOLD':
@@ -250,8 +260,15 @@ class PokerGame:
                     next_token_probs = global_model.predict(sequence_input, verbose=0)[0]
                     
                     # Sample the next token
-                    next_token_probs = np.array(next_token_probs) + 0.1 # + 1e-8
+                    next_token_probs = np.array(next_token_probs) + 0.01 # + 1e-8
                     next_token_probs = next_token_probs / np.sum(next_token_probs)
+                    
+                    # Print predicted probabilities for each action
+                    formatted_probs = []
+                    for i, (prob, token) in enumerate(zip(next_token_probs, shorthand_output_tokens)):
+                        formatted_probs.append(f"{token} ({prob:.4f})")
+                    self.log(" • ".join(formatted_probs))
+                    
                     next_token_idx = np.random.choice(len(next_token_probs), p=next_token_probs)
                     next_token = output_tokens[next_token_idx]
                     
@@ -306,7 +323,19 @@ class PokerGame:
             # Calculate bet amount - at least the minimum bet and ensure bet amount doesn't exceed stack
             bet_amount = min(max(min_bet, 0 if octal_value == "" else int(octal_value, 8)), player.stack)
             
-            if self.current_bet == 0:  # Betting
+            if bet_amount == player.stack:
+                total_bet = player.current_bet + bet_amount
+                self.pot += bet_amount
+                if total_bet > self.current_bet:
+                    self.current_bet = total_bet
+                player.current_bet = total_bet
+                player.stack = 0
+                action_str = "all-in"
+                
+                self.record_action(street, player_idx, "ALL_IN", total_bet)
+                self.log(f"{player.name} goes all-in ({total_bet})")
+                
+            elif self.current_bet == 0:  # Betting
                 self.pot += bet_amount
                 player.stack -= bet_amount
                 
@@ -328,20 +357,6 @@ class PokerGame:
                 
                 self.record_action(street, player_idx, "RAISE", self.current_bet)
                 self.log(f"{player.name} raises to {self.current_bet}")
-        
-        elif action_token == 'ALL_IN':
-            # All-in action
-            bet_amount = player.stack  # All remaining chips
-            total_bet = player.current_bet + bet_amount
-            self.pot += bet_amount
-            if total_bet > self.current_bet:
-                self.current_bet = total_bet
-            player.current_bet = total_bet
-            player.stack = 0
-            action_str = "all-in"
-            
-            self.record_action(street, player_idx, "ALL_IN", total_bet)
-            self.log(f"{player.name} goes all-in ({total_bet})")
         
         return action_str
     
@@ -665,19 +680,19 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
     
     # Compile the model with an appropriate optimizer and loss function
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    global_model.compile(optimizer=optimizer, 
-                        loss='sparse_categorical_crossentropy',
-                        metrics=['accuracy'])
+    global_model.compile(optimizer=optimizer,loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
     # Token mappings
     token_to_id = {token: i for i, token in enumerate(vocabulary)}
     action_to_id = {action: i for i, action in enumerate(output_tokens)}
     
-    # For tracking progress
-    avg_rewards = []
-    
     for epoch in range(epochs):
+        epoch_start_time = time.time()
         print(f"\nEpoch {epoch+1}/{epochs}")
+        
+        print("\n=== BASELINE PERFORMANCE ===")
+        game = PokerGame(verbose=True)
+        game.play_game(num_hands=1)
         
         training_data = []
         for hand in range(hands_per_epoch):
@@ -716,10 +731,35 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
         actions = np.array(actions)
         rewards = np.array(rewards)
         
+         # Add statistics for positive rewards
+        positive_rewards = rewards[rewards > 0]
+        if len(positive_rewards) > 0:
+            print("\n=== POSITIVE REWARDS STATISTICS ===")
+            print(f"Total positive decisions: {len(positive_rewards)}")
+            print(f"Mean reward: {np.mean(positive_rewards):.4f}")
+            print(f"Median reward: {np.median(positive_rewards):.4f}")
+            print(f"Min reward: {np.min(positive_rewards):.4f}")
+            print(f"Max reward: {np.max(positive_rewards):.4f}")
+            print(f"Std dev: {np.std(positive_rewards):.4f}")
+            
+            # Distribution of rewards by percentile
+            percentiles = [25, 50, 75, 90, 95, 99]
+            print("\nReward percentiles:")
+            for p in percentiles:
+                print(f"{p}th percentile: {np.percentile(positive_rewards, p):.4f}")
+                
+            # Action distribution for positive rewards
+            positive_actions = actions[rewards > 0]
+            unique_actions, action_counts = np.unique(positive_actions, return_counts=True)
+            print("\nAction distribution for winning decisions:")
+            for action, count in zip(unique_actions, action_counts):
+                action_name = output_tokens[action]
+                percentage = (count / len(positive_actions)) * 100
+                print(f"{action_name}: {count} ({percentage:.1f}%)")
+        
         # Normalize rewards
         if len(rewards) > 0:
             rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-8)
-            avg_rewards.append(np.mean(rewards))
         
         # Train in batches
         num_samples = len(states)
@@ -743,7 +783,10 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
                 verbose=0
             )
         
-        print(f"Epoch {epoch+1} complete. Average reward: {np.mean(avg_rewards[-1] if avg_rewards else 0):.4f}")
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+        
+        print(f"Epoch {epoch+1} complete in {epoch_duration:.2f} seconds")
     
     print("\nTraining complete!")
     save_model(global_model)
@@ -753,16 +796,12 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
 if __name__ == "__main__":
     print("Initializing AI model...")
     
-    # First play without training to establish a baseline
-    print("\n=== BASELINE PERFORMANCE (BEFORE TRAINING) ===")
-    game = PokerGame(verbose=True)
-    game.play_game(num_hands=1)
-    
     # Now train the model
     print("\n=== STARTING MODEL TRAINING ===")
-    train_model(epochs=10, hands_per_epoch=100, batch_size=1)
+    train_model(epochs=3, hands_per_epoch=1000, batch_size=100)
     
     # Test the trained model
     print("\n=== EVALUATING TRAINED MODEL ===")
-    game = PokerGame(verbose=True)
-    game.play_game(num_hands=3)
+    for i in range (3):
+        game = PokerGame(verbose=True)
+        game.play_game(num_hands=1)

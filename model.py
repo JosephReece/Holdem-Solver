@@ -39,9 +39,8 @@ vocabulary = [
 output_tokens = [
     'FOLD',
     'PASSIVE_ACTION',  # Check or Call
-    'START_AGGRESSIVE_ACTION',  # Begin Bet or Raise (Use OCTAL_X tokens until END_AGGRESSIVE_ACTION)
+    'START_AGGRESSIVE_ACTION',  # Begin Bet, Raise or All-in (Use OCTAL_X tokens until END_AGGRESSIVE_ACTION)
     'END_AGGRESSIVE_ACTION',
-    'ALL_IN',
     'OCTAL_0',
     'OCTAL_1',
     'OCTAL_2',
@@ -52,48 +51,53 @@ output_tokens = [
     'OCTAL_7'
 ]
 
-def load_model():
-    return create_model()
-    
-    # try:
-    #     model = tf.keras.models.load_model(model_path)
-    #     return model
-    # except:
-    #     model = create_model()
-    #     return model
+def load_model():    
+    try:
+        model = tf.keras.models.load_model(model_path)
+        return model
+    except:
+        model = create_model()
+        return model
+
+import tensorflow as tf
 
 def create_model():
-    # inputs = tf.keras.layers.Input(shape=(None,), dtype=tf.int32)
+    # Adjustable parameters
+    transformer_depth = 4
+    feed_forward_units = 2048
+    attention_key_dim = 64
+    attention_num_heads = 8
+    embedding_size = 512
     
     inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
     embedding = tf.keras.layers.Embedding(
         input_dim=len(vocabulary),
-        output_dim=512
+        output_dim=embedding_size
     )(inputs)
     
     def transformer_block(input_layer):
         # Multi-head attention
         attention = tf.keras.layers.MultiHeadAttention(
-            num_heads=8,
-            key_dim=64
+            num_heads=attention_num_heads,
+            key_dim=attention_key_dim
         )(input_layer, input_layer)
         
         # Add & Norm
         add_norm1 = tf.keras.layers.LayerNormalization()(tf.keras.layers.Add()([input_layer, attention]))
         
         # Feed Forward Network
-        feed_forward = tf.keras.layers.Dense(units=1024, activation='relu')(add_norm1)
-        feed_forward_output = tf.keras.layers.Dense(units=512)(feed_forward)
+        feed_forward = tf.keras.layers.Dense(units=feed_forward_units, activation='relu')(add_norm1)
+        feed_forward_output = tf.keras.layers.Dense(units=embedding_size)(feed_forward)
         
         # Add & Norm
         return tf.keras.layers.LayerNormalization()(tf.keras.layers.Add()([add_norm1, feed_forward_output]))
     
     transformer_output = embedding
-    for _ in range(6):
+    for _ in range(transformer_depth):
         transformer_output = transformer_block(transformer_output)
     
     global_avg_pool = tf.keras.layers.GlobalAveragePooling1D()(transformer_output)
-    outputs = tf.keras.layers.Dense(units=13, activation='softmax')(global_avg_pool)
+    outputs = tf.keras.layers.Dense(units=len(output_tokens), activation='softmax')(global_avg_pool)
     
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     
