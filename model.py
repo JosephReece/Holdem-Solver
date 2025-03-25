@@ -165,28 +165,31 @@ def encode_game_state(game, hero_idx):
         
     tokens.append("EOS")
     
-    # Pad the sequence
-    if len(tokens) > max_sequence_length:
-        tokens = tokens[:max_sequence_length]
-    tokens = tokens + ['PAD'] * (max_sequence_length - len(tokens))
-
     return " ".join(tokens)
 
+def pad_sequence(sequence):
+    tokens = sequence.split()
+    
+    if len(tokens) > max_sequence_length:
+        tokens = tokens[:max_sequence_length]
+        return " ".join(tokens)
+    
+    return sequence + ' PAD' * (max_sequence_length - len(tokens))
 
 def encode_street_actions(actions, hero_idx, hero_position, opponent_position):
     """Helper function to encode actions for a street."""
     tokens = []
     
     for action in actions:
-        position = hero_position if action["player_idx"] == hero_idx else opponent_position
-        tokens.append(position)
-        
         action_type = action["action"]
         if action_type == "POST":
             continue
-        else:
-            tokens.append(action_type)
-            if action_type in ["BET", "RAISE", "ALL_IN"]:
-                tokens.extend(amount_as_tokens(action["amount"]))
+        
+        position = hero_position if action["player_idx"] == hero_idx else opponent_position
+        tokens.append(position)
+        
+        tokens.append(action_type)
+        if action_type in ["BET", "RAISE", "ALL_IN"]:
+            tokens.extend(amount_as_tokens(action["amount"]))
     
     return tokens
