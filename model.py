@@ -38,16 +38,14 @@ vocabulary = [
 
 output_tokens = [
     'FOLD',
-    'PASSIVE_ACTION',  # Check, Call or End Betting/Raising
-    # Begin Bet, Raise or All-in (Use OCTAL_X tokens until PASSIVE_ACTION)
-    'OCTAL_0',
-    'OCTAL_1',
-    'OCTAL_2',
-    'OCTAL_3',
-    'OCTAL_4',
-    'OCTAL_5',
-    'OCTAL_6',
-    'OCTAL_7'
+    'PASSIVE_ACTION',  # Check or Call
+    'ALL_IN',
+    'BET_33',
+    'BET_50',
+    'BET_66',
+    'BET_90',
+    'BET_120',
+    'BET_150'
 ]
 
 def load_model():    
