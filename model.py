@@ -38,9 +38,8 @@ vocabulary = [
 
 output_tokens = [
     'FOLD',
-    'PASSIVE_ACTION',  # Check or Call
-    'START_AGGRESSIVE_ACTION',  # Begin Bet, Raise or All-in (Use OCTAL_X tokens until END_AGGRESSIVE_ACTION)
-    'END_AGGRESSIVE_ACTION',
+    'PASSIVE_ACTION',  # Check, Call or End Betting/Raising
+    # Begin Bet, Raise or All-in (Use OCTAL_X tokens until PASSIVE_ACTION)
     'OCTAL_0',
     'OCTAL_1',
     'OCTAL_2',
@@ -63,11 +62,11 @@ import tensorflow as tf
 
 def create_model():
     # Adjustable parameters
-    transformer_depth = 4
-    feed_forward_units = 2048
-    attention_key_dim = 64
-    attention_num_heads = 8
-    embedding_size = 512
+    transformer_depth = 1
+    feed_forward_units = 512
+    attention_key_dim = 32
+    attention_num_heads = 4
+    embedding_size = 256
     
     inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
     embedding = tf.keras.layers.Embedding(

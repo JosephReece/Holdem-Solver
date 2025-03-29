@@ -9,7 +9,7 @@ from model import encode_game_state, load_model, save_model, vocabulary, output_
 global_model = load_model()
 
 # Human-Readable tokens for printing
-shorthand_output_tokens = ['Fold', 'Check/Call', 'Start Bet/Raise', 'End Bet/Raise', '0', '1', '2', '3', '4', '5', '6', '7']
+shorthand_output_tokens = ['Fold', 'Check/Call/End Betting', '0', '1', '2', '3', '4', '5', '6', '7']
 
 class Player:
     def __init__(self, name, stack):
@@ -109,7 +109,13 @@ class PokerGame:
     def get_ai_action(self, player_idx):
         """
         Get action from the AI model for the player with proper validation and resampling for invalid actions.
-        Includes training data for each octal digit prediction and end aggressive action token.
+        Valid tokens are:
+           - "FOLD"
+           - "PASSIVE_ACTION" (represented by "Passive" in shorthand)
+           - Any token starting with "OCTAL_" (including OCTAL_0)
+        When an octal token is selected the aggressive action sequence begins. In that sequence,
+        octal tokens (e.g. OCTAL_3, OCTAL_0, ...) are accumulated until a "PASSIVE_ACTION" is produced,
+        which stops the betting sequence.
         """
         player = self.players[player_idx]
         opponent = self.players[1 - player_idx]
@@ -123,7 +129,6 @@ class PokerGame:
         # If player has no chips, they can only check or fold
         if player.stack == 0:
             action = "check" if call_amount == 0 else "fold"
-            # Determine current street for recording to history
             street = self.determine_current_street()
             self.record_action(street, player_idx, action)
             return action
@@ -139,88 +144,61 @@ class PokerGame:
         tokenized_input = [token_to_id.get(token, 0) for token in game_state.split()]
         model_input = tf.expand_dims(tf.constant(tokenized_input), 0)
         
-        # Get initial action with validation
-        valid_action = False
+        # Get an initial action token with validation
         action_token = None
-        
-        # Maximum resampling attempts
         max_attempts = 3
         attempts = 0
         
-        while not valid_action and attempts < max_attempts:
-            # Get prediction from model
+        while attempts < max_attempts:
             prediction = global_model.predict(model_input, verbose=0)[0]
+            prediction = np.array(prediction) + 1/100  # smoothing factor
+            prediction = prediction / np.sum(prediction)  # Normalize probabilities
             
-            # Sample from the prediction probability distribution
-            prediction = np.array(prediction) + 0.01 # + 1e-8
-            prediction = prediction / np.sum(prediction)  # Normalize to ensure sum = 1
-            
-            # Print predicted probabilities for each action
+            # For logging
             formatted_probs = []
             for i, (prob, token) in enumerate(zip(prediction, shorthand_output_tokens)):
                 formatted_probs.append(f"{token} ({prob:.4f})")
             self.log(" • ".join(formatted_probs))
-                
+            
             action_idx = np.random.choice(len(prediction), p=prediction)
             action_token = output_tokens[action_idx]
             
-            # Check if the action is valid (not octal or end aggressive outside of betting loop)
-            if not action_token.startswith('OCTAL_') and action_token != 'END_AGGRESSIVE_ACTION':
-                valid_action = True
-            
             attempts += 1
         
-        # Determine current street for recording to history
+        # Determine the current betting street
         street = self.determine_current_street()
         
-        # If we couldn't get a valid action after several attempts, default to a safe action
-        if not valid_action:
-            if call_amount == 0:
-                self.record_action(street, player_idx, "CHECK")
-                self.log(f"{player.name} checks (default action)")
-                
-                return "check"
-            else:
-                player.is_folded = True
-                self.record_action(street, player_idx, "FOLD")
-                self.log(f"{player.name} folds (default action)")
-                
-                return "fold"
-        
-        # Add initial action to training data
+        # Record the initial action in training data
         self.training_data.append({
             'player_idx': player_idx,
             'state': game_state,
             'action': action_token,
             'stack_before': player.stack,
-            'reward': None  # Will be filled in later
+            'reward': None  # will be filled later
         })
         
-        # Process the action based on the token
+        # Process based on the token type
         if action_token == 'FOLD':
             player.is_folded = True
             self.record_action(street, player_idx, "FOLD")
             self.log(f"{player.name} folds")
-            
             return "fold"
         
         elif action_token == 'PASSIVE_ACTION':
+            # Passive action: if no bet is required then check; otherwise, call.
             if call_amount == 0:
                 self.record_action(street, player_idx, "CHECK")
                 self.log(f"{player.name} checks")
-                
-                return 'check'
+                return "check"
             else:
-                # Call logic
-                if player.stack <= call_amount:  # Call is actually all-in
-                    bet_amount = player.stack  # Can only call with what they have
+                if player.stack <= call_amount:  # call is effectively all-in
+                    bet_amount = player.stack
                     self.pot += bet_amount
                     player.current_bet += bet_amount
                     player.stack = 0
                     
                     self.record_action(street, player_idx, "CALL", player.current_bet)
                     self.log(f"{player.name} calls {bet_amount} (all-in)")
-                    
                     return f"call {bet_amount} (all-in)"
                 else:
                     bet_amount = call_amount
@@ -230,99 +208,83 @@ class PokerGame:
                     
                     self.record_action(street, player_idx, "CALL", bet_amount)
                     self.log(f"{player.name} calls {bet_amount}")
-                    
                     return f"call {bet_amount}"
         
-        elif action_token == 'START_AGGRESSIVE_ACTION':
-            # For aggressive actions, we need to sample octal tokens to determine the bet amount
+        elif action_token.startswith('OCTAL_'):
+            # Begin an aggressive betting sequence.
             octal_value = ""
+            # Process the first token (even if it is OCTAL_0)
+            digit = action_token.split('_')[1]
+            octal_value += digit
             
-            # Add SDM (Start Decision Making) token to the state
-            current_sequence = encoded_state + " SDM"
+            # Update the state sequence (for training) with the chosen octal token.
+            current_sequence = encoded_state + " SDM " + action_token
             
-            # Keep sampling octal digits until we get END_AGGRESSIVE_ACTION
-            max_digits = 10  # Safety limit to prevent infinite loops
-            got_end_token = False
-            
-            while len(octal_value) < max_digits and not got_end_token:
-                # Tokenize the current sequence
+            # Now continue to sample tokens until we see a PASSIVE_ACTION,
+            # which indicates that the aggressive sequence is complete.
+            max_iterations = 10
+            iterations = 0
+            while iterations < max_iterations:
                 tokenized_sequence = [token_to_id.get(token, 0) for token in current_sequence.split()]
                 sequence_input = tf.expand_dims(tf.constant(tokenized_sequence), 0)
+                next_prediction = global_model.predict(sequence_input, verbose=0)[0]
+                next_prediction = np.array(next_prediction) + 1/100
+                next_prediction = next_prediction / np.sum(next_prediction)
                 
-                # Get valid action inside betting loop (only octal or end tokens)
-                valid_betting_action = False
-                next_token = None
-                betting_attempts = 0
-                max_betting_attempts = 10
+                # For logging next-token probabilities:
+                formatted_probs = []
+                for i, (prob, token) in enumerate(zip(next_prediction, shorthand_output_tokens)):
+                    formatted_probs.append(f"{token} ({prob:.4f})")
+                self.log(" • ".join(formatted_probs))
                 
-                while not valid_betting_action and betting_attempts < max_betting_attempts:
-                    # Get prediction for the next token
-                    next_token_probs = global_model.predict(sequence_input, verbose=0)[0]
-                    
-                    # Sample the next token
-                    next_token_probs = np.array(next_token_probs) + 0.01 # + 1e-8
-                    next_token_probs = next_token_probs / np.sum(next_token_probs)
-                    
-                    # Print predicted probabilities for each action
-                    formatted_probs = []
-                    for i, (prob, token) in enumerate(zip(next_token_probs, shorthand_output_tokens)):
-                        formatted_probs.append(f"{token} ({prob:.4f})")
-                    self.log(" • ".join(formatted_probs))
-                    
-                    next_token_idx = np.random.choice(len(next_token_probs), p=next_token_probs)
-                    next_token = output_tokens[next_token_idx]
-                    
-                    # Check if token is valid for betting loop
-                    if next_token.startswith('OCTAL_') or next_token == 'END_AGGRESSIVE_ACTION':
-                        valid_betting_action = True
-                    
-                    betting_attempts += 1
+                next_token_idx = np.random.choice(len(next_prediction), p=next_prediction)
+                next_token = output_tokens[next_token_idx]
                 
-                # If we couldn't get a valid betting token, force END_AGGRESSIVE_ACTION
-                if not valid_betting_action:
-                    next_token = 'END_AGGRESSIVE_ACTION'
-                
-                # Add training data for this token prediction
+                # Record the token prediction in training data.
                 self.training_data.append({
                     'player_idx': player_idx,
                     'state': pad_sequence(current_sequence),
                     'action': next_token,
                     'stack_before': player.stack,
-                    'reward': None  # Will be filled in later
-                })
-                
-                # Check if we've reached the end
-                if next_token == 'END_AGGRESSIVE_ACTION':
-                    got_end_token = True
-                    break
-                
-                # Process octal digit
-                if next_token.startswith('OCTAL_'):
-                    digit = next_token.split('_')[1]
-                    octal_value += digit
-                
-                # Update state for next iteration
-                current_sequence = current_sequence + " " + next_token
-            
-            # If we didn't get an END_AGGRESSIVE_ACTION, add it as training data
-            if not got_end_token:
-                # Add the ending token to the sequence
-                self.training_data.append({
-                    'player_idx': player_idx,
-                    'state': pad_sequence(current_sequence),
-                    'action': 'END_AGGRESSIVE_ACTION',
-                    'stack_before': player.stack,
                     'reward': None
                 })
-        
-            # Calculate the actual bet amount
+                
+                if next_token == 'PASSIVE_ACTION':
+                    # PASSIVE_ACTION stops the aggressive sequence.
+                    break
+                elif next_token.startswith('OCTAL_'):
+                    # Append the digit (even if it is a "0")
+                    digit = next_token.split('_')[1]
+                    octal_value += digit
+                else:
+                    # Decides to fold during betting
+                    player.is_folded = True
+                    self.record_action(street, player_idx, "FOLD")
+                    self.log(f"{player.name} folds")
+                    return "fold"
+                
+                current_sequence += " " + next_token
+                iterations += 1
+            
+            # Calculate the minimum bet first.
             min_bet = self.big_blind
-            if call_amount > 0:  # Raising
+            if call_amount > 0:
                 min_bet = call_amount + self.big_blind
             
-            # Calculate bet amount - at least the minimum bet and ensure bet amount doesn't exceed stack
-            bet_amount = min(max(min_bet, 0 if octal_value == "" else int(octal_value, 8)), player.stack)
+            # Convert the octal string (if "0", then use min_bet)
+            try:
+                bet_as_int = int(octal_value, 8)
+            except Exception:
+                bet_as_int = 0
+            if bet_as_int == 0:
+                bet_amount = min_bet
+            else:
+                bet_amount = bet_as_int
+                if bet_amount < min_bet:
+                    bet_amount = min_bet
+            bet_amount = min(bet_amount, player.stack)
             
+            # Process the bet action
             if bet_amount == player.stack:
                 total_bet = player.current_bet + bet_amount
                 self.pot += bet_amount
@@ -331,38 +293,34 @@ class PokerGame:
                 player.current_bet = total_bet
                 player.stack = 0
                 action_str = "all-in"
-                
                 self.record_action(street, player_idx, "ALL_IN", total_bet)
                 self.log(f"{player.name} goes all-in ({total_bet})")
-                
-            elif self.current_bet == 0:  # Betting
+            elif self.current_bet == 0:
                 self.pot += bet_amount
                 player.stack -= bet_amount
-                
                 self.current_bet = bet_amount
                 player.current_bet = bet_amount
-                
                 action_str = "bet"
-                
                 self.record_action(street, player_idx, "BET", bet_amount)
                 self.log(f"{player.name} bets {bet_amount}")
-            else:  # Raising
+            else:
                 self.pot += bet_amount
                 player.stack -= bet_amount
-                
                 self.current_bet = player.current_bet + bet_amount
                 player.current_bet = self.current_bet
-                
                 action_str = "raise"
-                
                 self.record_action(street, player_idx, "RAISE", self.current_bet)
                 self.log(f"{player.name} raises to {self.current_bet}")
+            
+            return action_str
         
-        return action_str
+        # Fallback (should not happen)
+        self.log("Defaulting to check")
+        return "check"
     
     def betting_round(self, first_player_idx):
         """
-        Run a betting round
+        Run a betting round.
         first_player_idx: Index of the player who acts first (0 or 1)
         Returns: Whether the hand is over (True if only one player left)
         """
@@ -371,7 +329,7 @@ class PokerGame:
         players_all_in = sum(1 for p in self.players if p.stack == 0)
         active_players = sum(1 for p in self.players if not p.is_folded)
         
-        # If all active players are all-in, no betting needed
+        # If all active players are all-in, no betting needed.
         if players_all_in == active_players:
             return active_players < 2
         
@@ -385,12 +343,12 @@ class PokerGame:
         last_raise = 0
         
         while True:
-            # Skip folded players
+            # Skip folded players.
             if self.players[player_idx].is_folded:
                 player_idx = 1 - player_idx
                 continue
             
-            # Skip all-in players
+            # Skip all-in players.
             if self.players[player_idx].stack == 0:
                 player_idx = 1 - player_idx
                 players_acted += 1
@@ -398,40 +356,40 @@ class PokerGame:
                     break
                 continue
                 
-            # Get action from the AI player
+            # Get action from the AI player.
             action = self.get_ai_action(player_idx)
             
-            # Process the action
+            # Process the action.
             if action == "fold":
-                # Check if only one player left
+                # Check if only one player left.
                 if sum(not p.is_folded for p in self.players) == 1:
                     return True
             
             elif action == "raise" or action == "bet" or action == "all-in":
-                # Update the last raise amount
+                # Update the last raise amount.
                 new_bet = self.players[player_idx].current_bet
                 prev_bet = self.players[1 - player_idx].current_bet if action == "raise" else 0
                 last_raise = new_bet - prev_bet
                 
-                # Reset players_acted to ensure the other player gets to act
+                # Reset players_acted so the other player gets to act.
                 players_acted = 0
             
             player_idx = 1 - player_idx
             players_acted += 1
             
-            # Check if betting round is complete
+            # Check if betting round is complete.
             if players_acted >= active_players and self.players[0].current_bet == self.players[1].current_bet:
                 break
         
         return False
     
     def determine_winner(self):
-        # Check if only one player is left (not folded)
+        # Check if only one player is left (not folded).
         active_players = [p for p in self.players if not p.is_folded]
         if len(active_players) == 1:
             return active_players[0]
         
-        # Compare hands for showdown
+        # Compare hands for showdown.
         hands = []
         for player in self.players:
             if not player.is_folded:
@@ -439,20 +397,19 @@ class PokerGame:
                 hand_type = get_hand_type(best_hand)
                 hands.append((player, best_hand, hand_type))
         
-        # Show the showdown information
+        # Show the showdown information.
         self.log("\n=== SHOWDOWN ===")
         for player, hand, hand_type in hands:
             self.log(f"{player.name}: {[str(card) for card in player.hand]} - {hand_type}")
         self.log(f"Community cards: {[str(card) for card in self.community_cards]}")
         
         if len(hands) == 2:
-            # Use compare_hands function to determine the winner
             result = compare_hands(hands[0][1], hands[1][1])
             if result == "Player 1":
-                return hands[0][0]  # Player object
+                return hands[0][0]
             elif result == "Player 2":
-                return hands[1][0]  # Player object
-            else:  # Tie
+                return hands[1][0]
+            else:
                 return None
         
         return None  # Shouldn't happen in heads-up
@@ -471,7 +428,6 @@ class PokerGame:
                     player_idx = action_data['player_idx']
                     action = action_data['action']
                     amount = action_data['amount']
-
                     player_name = self.players[player_idx].name
                     if amount is not None:
                         self.log(f"({player_name}): {action} {amount}")
@@ -483,32 +439,44 @@ class PokerGame:
     def compute_rewards(self, winner):
         """
         Compute rewards for all decisions made in the hand.
-        This uses a simplified reward system where winning = positive reward,
-        losing = negative reward, with the magnitude based on pot size.
+        Instead of basing the reward on the change in the decision maker's own stack,
+        we assign as reward the number of chips won from the opponent's stack.
+        
+        The hand starting stacks are recorded at the beginning of the hand.
+        For a winning hand, reward for each decision made by the winner is:
+            opponent_start_stack - opponent_final_stack
+        For decisions made by the loser, the reward is the negative of that amount.
+        For ties, rewards are 0.
         """
         if winner is None:
-            # Split pot - small positive reward for both
             for data in self.training_data:
-                data['reward'] = self.pot / 4  # Small positive reward for tie
-        else:
-            winner_idx = self.players.index(winner)
-            for data in self.training_data:
-                # Decisions by winner get positive reward proportional to pot size
-                if data['player_idx'] == winner_idx:
-                    data['reward'] = self.pot / 2
-                else:
-                    # Decisions by loser get negative reward proportional to pot size
-                    data['reward'] = -self.pot / 2
+                data['reward'] = 0
+            return
+        
+        winner_idx = self.players.index(winner)
+        loser_idx = 1 - winner_idx
+        
+        winning_reward = self.hand_starting_stacks[loser_idx] - self.players[loser_idx].stack
+        losing_reward = -winning_reward
+        
+        for data in self.training_data:
+            if data['player_idx'] == winner_idx:
+                data['reward'] = winning_reward
+            else:
+                data['reward'] = losing_reward
     
     def play_hand(self):
-        # Reset for new hand
+        # Record each player's starting stack before any forced bets (blinds) are posted.
+        self.hand_starting_stacks = [player.stack for player in self.players]
+        
+        # Reset for new hand.
         self.pot = 0
         self.current_bet = 0
         self.community_cards = []
         for player in self.players:
             player.reset_hand()
         
-        # Reset history for new hand
+        # Reset history for new hand.
         self.history = {
             "preflop": [],
             "flop": [],
@@ -516,19 +484,19 @@ class PokerGame:
             "river": []
         }
         
-        # Reset training data for new hand
+        # Reset training data for new hand.
         self.training_data = []
         
-        # Determine positions
+        # Determine positions.
         button_idx = self.button_player_idx
-        sb_idx = button_idx  # In heads-up, button is also SB
+        sb_idx = button_idx  # In heads-up, button is also small blind.
         bb_idx = 1 - button_idx
         
         self.log("\n" + "="*50)
         self.log(f"NEW HAND - {self.players[0].name}: {self.players[0].stack} chips, {self.players[1].name}: {self.players[1].stack} chips")
         self.log(f"{self.players[button_idx].name} has the button (small blind)")
         
-        # Post blinds
+        # Post blinds.
         sb_amount = min(self.small_blind, self.players[sb_idx].stack)
         bb_amount = min(self.big_blind, self.players[bb_idx].stack)
         
@@ -543,21 +511,20 @@ class PokerGame:
         self.log(f"{self.players[sb_idx].name} posts small blind: {sb_amount}")
         self.log(f"{self.players[bb_idx].name} posts big blind: {bb_amount}")
         
-        # Record blinds in history
+        # Record blinds in history.
         self.record_action("preflop", sb_idx, "POST", sb_amount)
         self.record_action("preflop", bb_idx, "POST", bb_amount)
         
-        # Deal hole cards
+        # Deal hole cards.
         self.deal_hole_cards()
         
-        # Show hole cards 
+        # Show hole cards.
         for i, player in enumerate(self.players):
             self.log(f"\n{player.name} cards: {[str(card) for card in player.hand]}")
         
-        # Pre-flop betting (SB acts first in heads-up)
+        # Pre-flop betting (small blind acts first in heads-up).
         self.log("\n--- PRE-FLOP ---")
         if self.betting_round(sb_idx):
-            # Hand is over - only one player left
             winner = self.determine_winner()
             self.compute_rewards(winner)
             self.award_pot(winner)
@@ -565,12 +532,12 @@ class PokerGame:
             self.switch_button()
             return self.training_data
         
-        # Flop
+        # Flop.
         self.log("\n--- FLOP ---")
         flop_cards = self.deal_community_cards(3)
         self.log(f"Flop: {[str(card) for card in flop_cards]}")
         
-        # Flop betting (BB acts first)
+        # Flop betting (big blind acts first).
         if self.betting_round(bb_idx):
             winner = self.determine_winner()
             self.compute_rewards(winner)
@@ -579,12 +546,12 @@ class PokerGame:
             self.switch_button()
             return self.training_data
         
-        # Turn
+        # Turn.
         self.log("\n--- TURN ---")
         turn_card = self.deal_community_cards(1)
         self.log(f"Turn: {[str(card) for card in turn_card]}")
         
-        # Turn betting (BB acts first)
+        # Turn betting (big blind acts first).
         if self.betting_round(bb_idx):
             winner = self.determine_winner()
             self.compute_rewards(winner)
@@ -593,12 +560,12 @@ class PokerGame:
             self.switch_button()
             return self.training_data
         
-        # River
+        # River.
         self.log("\n--- RIVER ---")
         river_card = self.deal_community_cards(1)
         self.log(f"River: {[str(card) for card in river_card]}")
         
-        # River betting (BB acts first)
+        # River betting (big blind acts first).
         if self.betting_round(bb_idx):
             winner = self.determine_winner()
             self.compute_rewards(winner)
@@ -607,7 +574,7 @@ class PokerGame:
             self.switch_button()
             return self.training_data
         
-        # Showdown
+        # Showdown.
         winner = self.determine_winner()
         self.compute_rewards(winner)
         self.award_pot(winner)
@@ -617,25 +584,21 @@ class PokerGame:
     
     def award_pot(self, winner):
         if winner is None:
-            # Split pot
             split_amount = self.pot // 2
             remainder = self.pot % 2
             
             self.players[0].stack += split_amount
             self.players[1].stack += split_amount
             
-            # Give the odd chip to the button player
             if remainder:
                 self.players[self.button_player_idx].stack += remainder
             
             self.log(f"\nTie game! Pot ({self.pot}) is split.")
-            # Record the result in history
             street = self.determine_current_street()
         else:
             winner.stack += self.pot
             winner_idx = self.players.index(winner)
             self.log(f"\n{winner.name} wins pot of {self.pot} chips!")
-            # Record the result in history
             street = self.determine_current_street()
     
     def play_game(self, num_hands=10, training=False):
@@ -653,7 +616,6 @@ class PokerGame:
                 self.log(f"\n{self.players[0].name} wins the game!")
                 break
             
-            # Play the hand and get training data
             hand_data = self.play_hand()
             
             if training:
@@ -666,7 +628,7 @@ class PokerGame:
         
         return all_training_data
 
-def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.001):
+def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.01):
     """
     Train the global model using reinforcement learning on self-play games.
     
@@ -678,11 +640,9 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
     """
     print("Starting model training...")
     
-    # Compile the model with an appropriate optimizer and loss function
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    global_model.compile(optimizer=optimizer,loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    global_model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
-    # Token mappings
     token_to_id = {token: i for i, token in enumerate(vocabulary)}
     action_to_id = {action: i for i, action in enumerate(output_tokens)}
     
@@ -696,7 +656,6 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
         
         training_data = []
         for hand in range(hands_per_epoch):
-            # Play games to collect training data
             print(f"Hand {hand+1}/{hands_per_epoch}")
             game = PokerGame(verbose=False)
             training_data += game.play_game(num_hands=1, training=True)
@@ -705,33 +664,23 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
             print("No training data collected in this epoch.")
             continue
         
-        # Process training data
         states = []
         actions = []
         rewards = []
         
         for data_point in training_data:
-            # Skip if no reward was assigned (shouldn't happen but just in case)
             if data_point['reward'] is None:
                 continue
-                
-            # Process state
             state_tokens = [token_to_id.get(token, 0) for token in data_point['state'].split()]
-                
-            # Get action ID
             action_id = action_to_id.get(data_point['action'], 0)
-            
-            # Append to lists
             states.append(state_tokens)
             actions.append(action_id)
             rewards.append(data_point['reward'])
         
-        # Convert to numpy arrays
         states = np.array(states)
         actions = np.array(actions)
         rewards = np.array(rewards)
         
-         # Add statistics for positive rewards
         positive_rewards = rewards[rewards > 0]
         if len(positive_rewards) > 0:
             print("\n=== POSITIVE REWARDS STATISTICS ===")
@@ -742,13 +691,11 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
             print(f"Max reward: {np.max(positive_rewards):.4f}")
             print(f"Std dev: {np.std(positive_rewards):.4f}")
             
-            # Distribution of rewards by percentile
             percentiles = [25, 50, 75, 90, 95, 99]
             print("\nReward percentiles:")
             for p in percentiles:
                 print(f"{p}th percentile: {np.percentile(positive_rewards, p):.4f}")
                 
-            # Action distribution for positive rewards
             positive_actions = actions[rewards > 0]
             unique_actions, action_counts = np.unique(positive_actions, return_counts=True)
             print("\nAction distribution for winning decisions:")
@@ -757,11 +704,9 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
                 percentage = (count / len(positive_actions)) * 100
                 print(f"{action_name}: {count} ({percentage:.1f}%)")
         
-        # Normalize rewards
         if len(rewards) > 0:
             rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-8)
         
-        # Train in batches
         num_samples = len(states)
         indices = np.arange(num_samples)
         np.random.shuffle(indices)
@@ -774,13 +719,12 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
             batch_actions = actions[batch_indices]
             batch_rewards = rewards[batch_indices]
             
-            # Custom training step with rewards as sample weights
             global_model.fit(
                 batch_states,
                 batch_actions,
                 sample_weight=batch_rewards,
                 epochs=1,
-                verbose=0
+                verbose=2
             )
         
         epoch_end_time = time.time()
@@ -792,16 +736,13 @@ def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00
     save_model(global_model)
     print("Model saved")
 
-# Start the game and training
 if __name__ == "__main__":
     print("Initializing AI model...")
     
-    # Now train the model
     print("\n=== STARTING MODEL TRAINING ===")
-    train_model(epochs=3, hands_per_epoch=1000, batch_size=100)
+    train_model(epochs=5, hands_per_epoch=1000, batch_size=100)
     
-    # Test the trained model
     print("\n=== EVALUATING TRAINED MODEL ===")
-    for i in range (3):
+    for i in range(3):
         game = PokerGame(verbose=True)
         game.play_game(num_hands=1)
