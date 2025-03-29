@@ -151,7 +151,7 @@ class PokerGame:
         
         while attempts < max_attempts:
             prediction = global_model.predict(model_input, verbose=0)[0]
-            prediction = np.array(prediction) + 1/100  # smoothing factor
+            prediction = np.array(prediction) + 1/110  # smoothing factor
             prediction = prediction / np.sum(prediction)  # Normalize probabilities
             
             # For logging
@@ -221,14 +221,24 @@ class PokerGame:
             current_sequence = encoded_state + " SDM " + action_token
             
             # Now continue to sample tokens until we see a PASSIVE_ACTION,
-            # which indicates that the aggressive sequence is complete.
-            max_iterations = 10
-            iterations = 0
-            while iterations < max_iterations:
+            # which indicates that the aggressive sequence is complete,
+            # or until the accumulated octal value exceeds the player's stack.
+            
+            # Calculate the player's max possible bet
+            max_possible_bet = player.stack
+            
+            # Keep track of current octal value as we accumulate digits
+            current_octal_value = int(octal_value, 8) if octal_value else 0
+            
+            while True:
+                # Check if current octal value would already be an all-in
+                if current_octal_value >= max_possible_bet:
+                    break
+                    
                 tokenized_sequence = [token_to_id.get(token, 0) for token in current_sequence.split()]
                 sequence_input = tf.expand_dims(tf.constant(tokenized_sequence), 0)
                 next_prediction = global_model.predict(sequence_input, verbose=0)[0]
-                next_prediction = np.array(next_prediction) + 1/100
+                next_prediction = np.array(next_prediction) + 1/110
                 next_prediction = next_prediction / np.sum(next_prediction)
                 
                 # For logging next-token probabilities:
@@ -256,6 +266,13 @@ class PokerGame:
                     # Append the digit (even if it is a "0")
                     digit = next_token.split('_')[1]
                     octal_value += digit
+                    
+                    # Update the current octal value
+                    try:
+                        current_octal_value = int(octal_value, 8)
+                    except Exception:
+                        # Handle invalid octal strings
+                        break
                 else:
                     # Decides to fold during betting
                     player.is_folded = True
@@ -264,7 +281,6 @@ class PokerGame:
                     return "fold"
                 
                 current_sequence += " " + next_token
-                iterations += 1
             
             # Calculate the minimum bet first.
             min_bet = self.big_blind
@@ -313,25 +329,26 @@ class PokerGame:
                 self.log(f"{player.name} raises to {self.current_bet}")
             
             return action_str
-        
+
         # Fallback (should not happen)
         self.log("Defaulting to check")
         return "check"
-    
+
     def betting_round(self, first_player_idx):
         """
         Run a betting round.
         first_player_idx: Index of the player who acts first (0 or 1)
-        Returns: Whether the hand is over (True if only one player left)
+        Returns: True if the hand is over (only one player left or both all-in)
         """
         player_idx = first_player_idx
         players_acted = 0
-        players_all_in = sum(1 for p in self.players if p.stack == 0)
+        players_all_in = sum(1 for p in self.players if p.stack == 0 and not p.is_folded)
         active_players = sum(1 for p in self.players if not p.is_folded)
         
         # If all active players are all-in, no betting needed.
-        if players_all_in == active_players:
-            return active_players < 2
+        if players_all_in == active_players and active_players > 1:
+            self.log("All active players are all-in. Skipping betting.")
+            return True
         
         # Reset current bet for the new round (if not preflop)
         if self.community_cards:
@@ -355,7 +372,7 @@ class PokerGame:
                 if players_acted >= active_players:
                     break
                 continue
-                
+                    
             # Get action from the AI player.
             action = self.get_ai_action(player_idx)
             
@@ -373,6 +390,13 @@ class PokerGame:
                 
                 # Reset players_acted so the other player gets to act.
                 players_acted = 0
+                
+                # Check if player just went all-in and the other active player is also all-in
+                players_all_in = sum(1 for p in self.players if p.stack == 0 and not p.is_folded)
+                active_players = sum(1 for p in self.players if not p.is_folded)
+                if players_all_in == active_players and active_players > 1:
+                    self.log("All players are all-in. Ending betting round.")
+                    return True
             
             player_idx = 1 - player_idx
             players_acted += 1
@@ -382,7 +406,69 @@ class PokerGame:
                 break
         
         return False
-    
+ 
+    def compute_rewards_by_equity(self, p1_equity, p2_equity):
+        """
+        Compute rewards for all decisions made in the hand based on equity percentages.
+        """
+        # Scale equity to [-1, 1] range (where 50% equity = 0 reward)
+        p1_scaled_reward = (p1_equity - 50) / 50
+        p2_scaled_reward = (p2_equity - 50) / 50
+        
+        # Calculate actual chip rewards based on pot
+        p1_chip_reward = int(self.pot * (p1_equity / 100)) - self.hand_starting_stacks[0] + self.players[0].stack
+        p2_chip_reward = int(self.pot * (p2_equity / 100)) - self.hand_starting_stacks[1] + self.players[1].stack
+        
+        for data in self.training_data:
+            if data['player_idx'] == 0:
+                data['reward'] = p1_chip_reward
+            else:
+                data['reward'] = p2_chip_reward
+
+    def award_pot_by_equity(self):
+        """
+        Calculate hand equities for all-in scenarios and award the pot accordingly.
+        """
+        active_players = [p for p in self.players if not p.is_folded]
+        
+        # If only one player is active (shouldn't happen here but just in case)
+        if len(active_players) == 1:
+            winner = active_players[0]
+            winner.stack += self.pot
+            winner_idx = self.players.index(winner)
+            self.log(f"\n{winner.name} wins pot of {self.pot} chips (opponent folded)!")
+            return
+        
+        # Calculate how many more cards we need to deal to complete the board
+        remaining_cards_needed = 5 - len(self.community_cards)
+        
+        # Run equity calculation
+        p1_equity, p2_equity = self.calculate_equity(
+            self.players[0].hand,
+            self.players[1].hand,
+            self.community_cards,
+            remaining_cards_needed
+        )
+        
+        self.log("\n=== EQUITY CALCULATION ===")
+        self.log(f"{self.players[0].name}: {[str(card) for card in self.players[0].hand]} - {p1_equity:.2f}% equity")
+        self.log(f"{self.players[1].name}: {[str(card) for card in self.players[1].hand]} - {p2_equity:.2f}% equity")
+        self.log(f"Community cards: {[str(card) for card in self.community_cards]}")
+        
+        # Award the pot according to equity percentages
+        p1_chips = int(self.pot * (p1_equity / 100))
+        p2_chips = self.pot - p1_chips  # Ensure no rounding errors
+        
+        self.players[0].stack += p1_chips
+        self.players[1].stack += p2_chips
+        
+        self.log(f"\nPot ({self.pot}) is split according to equity:")
+        self.log(f"{self.players[0].name} receives {p1_chips} chips ({p1_equity:.2f}%)")
+        self.log(f"{self.players[1].name} receives {p2_chips} chips ({p2_equity:.2f}%)")
+        
+        # Compute rewards based on equity
+        self.compute_rewards_by_equity(p1_equity, p2_equity)
+                
     def determine_winner(self):
         # Check if only one player is left (not folded).
         active_players = [p for p in self.players if not p.is_folded]
@@ -464,7 +550,62 @@ class PokerGame:
                 data['reward'] = winning_reward
             else:
                 data['reward'] = losing_reward
-    
+
+    def calculate_equity(self, player1_hand, player2_hand, board, remaining_cards):
+        """
+        Calculate equity percentages when players are all-in.
+        
+        Parameters:
+            player1_hand: List of Card objects for player 1's hand
+            player2_hand: List of Card objects for player 2's hand
+            board: List of Card objects already on the board
+            remaining_cards: Number of cards still to be dealt to complete the board
+        
+        Returns:
+            Tuple of (player1_equity_percentage, player2_equity_percentage)
+        """
+        # For a full equity calculation, we would simulate all possible remaining boards.
+        # For simplicity, we'll run a Monte Carlo simulation with a reasonable number of trials.
+        
+        trials = 1000
+        p1_wins = 0
+        p2_wins = 0
+        ties = 0
+        
+        # Create a deck excluding the cards already in play
+        all_cards_in_play = player1_hand + player2_hand + board
+        all_card_strings = [str(card) for card in all_cards_in_play]
+        
+        # Run the trials
+        for _ in range(trials):
+            # Create a new deck for each trial
+            trial_deck = Deck()
+            
+            # Remove cards that are already in play
+            trial_deck.cards = [card for card in trial_deck.cards if str(card) not in all_card_strings]
+            
+            # Deal the remaining community cards
+            trial_board = board.copy()
+            trial_board.extend(trial_deck.draw_cards(remaining_cards))
+            
+            # Compare the hands to determine the winner
+            player1_full_hand = player1_hand + trial_board
+            player2_full_hand = player2_hand + trial_board
+            
+            result = compare_hands(player1_full_hand, player2_full_hand)
+            
+            if result == "Player 1":
+                p1_wins += 1
+            elif result == "Player 2":
+                p2_wins += 1
+            else:
+                ties += 1
+        
+        p1_equity = (p1_wins + (ties / 2)) / trials * 100
+        p2_equity = (p2_wins + (ties / 2)) / trials * 100
+        
+        return (p1_equity, p2_equity)
+
     def play_hand(self):
         # Record each player's starting stack before any forced bets (blinds) are posted.
         self.hand_starting_stacks = [player.stack for player in self.players]
@@ -525,12 +666,24 @@ class PokerGame:
         # Pre-flop betting (small blind acts first in heads-up).
         self.log("\n--- PRE-FLOP ---")
         if self.betting_round(sb_idx):
-            winner = self.determine_winner()
-            self.compute_rewards(winner)
-            self.award_pot(winner)
-            self.display_hand_history()
-            self.switch_button()
-            return self.training_data
+            # Check if one player folded
+            active_players = [p for p in self.players if not p.is_folded]
+            if len(active_players) == 1:
+                winner = active_players[0]
+                self.compute_rewards(winner)
+                self.award_pot(winner)
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
+            
+            # Check if both players are all-in
+            if all(player.stack == 0 for player in self.players if not player.is_folded):
+                self.log("\n--- BOTH PLAYERS ALL-IN! CALCULATING EQUITY ---")
+                # Calculate equity and award pot based on equity without dealing more cards
+                self.award_pot_by_equity()
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
         
         # Flop.
         self.log("\n--- FLOP ---")
@@ -539,12 +692,24 @@ class PokerGame:
         
         # Flop betting (big blind acts first).
         if self.betting_round(bb_idx):
-            winner = self.determine_winner()
-            self.compute_rewards(winner)
-            self.award_pot(winner)
-            self.display_hand_history()
-            self.switch_button()
-            return self.training_data
+            # Check if one player folded
+            active_players = [p for p in self.players if not p.is_folded]
+            if len(active_players) == 1:
+                winner = active_players[0]
+                self.compute_rewards(winner)
+                self.award_pot(winner)
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
+            
+            # Check if both players are all-in
+            if all(player.stack == 0 for player in self.players if not player.is_folded):
+                self.log("\n--- BOTH PLAYERS ALL-IN! CALCULATING EQUITY ---")
+                # Calculate equity and award pot based on equity without dealing more cards
+                self.award_pot_by_equity()
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
         
         # Turn.
         self.log("\n--- TURN ---")
@@ -553,12 +718,24 @@ class PokerGame:
         
         # Turn betting (big blind acts first).
         if self.betting_round(bb_idx):
-            winner = self.determine_winner()
-            self.compute_rewards(winner)
-            self.award_pot(winner)
-            self.display_hand_history()
-            self.switch_button()
-            return self.training_data
+            # Check if one player folded
+            active_players = [p for p in self.players if not p.is_folded]
+            if len(active_players) == 1:
+                winner = active_players[0]
+                self.compute_rewards(winner)
+                self.award_pot(winner)
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
+            
+            # Check if both players are all-in
+            if all(player.stack == 0 for player in self.players if not player.is_folded):
+                self.log("\n--- BOTH PLAYERS ALL-IN! CALCULATING EQUITY ---")
+                # Calculate equity and award pot based on equity without dealing more cards
+                self.award_pot_by_equity()
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
         
         # River.
         self.log("\n--- RIVER ---")
@@ -567,12 +744,15 @@ class PokerGame:
         
         # River betting (big blind acts first).
         if self.betting_round(bb_idx):
-            winner = self.determine_winner()
-            self.compute_rewards(winner)
-            self.award_pot(winner)
-            self.display_hand_history()
-            self.switch_button()
-            return self.training_data
+            # Check if one player folded
+            active_players = [p for p in self.players if not p.is_folded]
+            if len(active_players) == 1:
+                winner = active_players[0]
+                self.compute_rewards(winner)
+                self.award_pot(winner)
+                self.display_hand_history()
+                self.switch_button()
+                return self.training_data
         
         # Showdown.
         winner = self.determine_winner()
@@ -581,7 +761,7 @@ class PokerGame:
         self.display_hand_history()
         self.switch_button()
         return self.training_data
-    
+
     def award_pot(self, winner):
         if winner is None:
             split_amount = self.pot // 2
@@ -628,7 +808,7 @@ class PokerGame:
         
         return all_training_data
 
-def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.01):
+def train_model(epochs=5, hands_per_epoch=100, batch_size=32, learning_rate=0.00001):
     """
     Train the global model using reinforcement learning on self-play games.
     

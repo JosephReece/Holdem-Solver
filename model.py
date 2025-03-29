@@ -63,10 +63,10 @@ import tensorflow as tf
 def create_model():
     # Adjustable parameters
     transformer_depth = 1
-    feed_forward_units = 512
-    attention_key_dim = 32
-    attention_num_heads = 4
-    embedding_size = 256
+    feed_forward_units = 64
+    attention_key_dim = 12
+    attention_num_heads = 2
+    embedding_size = 64
     
     inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
     embedding = tf.keras.layers.Embedding(
