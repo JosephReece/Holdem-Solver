@@ -1,54 +1,63 @@
 import tensorflow as tf
 
 model_path = "models/model.keras"
+max_sequence_length = 64
 
-max_sequence_length = 256
-
+# Token set for No-Limit Hold'em GTO Solver
 vocabulary = [
-    # Pad Token
-    'PAD',
+    # Special tokens
+    "PAD",  # Padding Token
+    "BOS",  # Beginning of sequence
+    "EOS",  # End of sequence
     
-    # Special Tokens
-    'EOS', 'BOS', 'SDM',
+    # Rank tokens (13)
+    "RANK_2", "RANK_3", "RANK_4", "RANK_5", "RANK_6", 
+    "RANK_7", "RANK_8", "RANK_9", "RANK_T", "RANK_J", 
+    "RANK_K", "RANK_Q", "RANK_A",
     
-    # Card Ranks
-    'RANK_2', 'RANK_3', 'RANK_4', 'RANK_5', 'RANK_6', 'RANK_7', 'RANK_8', 'RANK_9', 'RANK_T', 'RANK_J', 'RANK_Q', 'RANK_K', 'RANK_A',
+    # Suit tokens (4)
+    "SUIT_C",  # Clubs
+    "SUIT_D",  # Diamonds
+    "SUIT_H",  # Hearts
+    "SUIT_S",  # Spades
     
-    # Suits
-    'SUIT_C', 'SUIT_D', 'SUIT_H', 'SUIT_S',
+    # Position tokens
+    "BTN",  # Button
+    "BB",   # Big Blind
     
-    # Octal Tokens
-    '0', '1', '2', '3', '4', '5', '6', '7',
+    # Action tokens
+    "FOLD",
+    "CHECK",
+    "POST",
+    "CALL",
+    "BET",
+    "RAISE",
+    "ALL_IN",
     
-    # Player Positions
-    'BTN', 'BB',
+    # Game state tokens
+    "PREFLOP",
+    "FLOP",
+    "TURN",
+    "RIVER",
     
-    # Actions
-    'FOLD', 'CHECK', 'CALL', 'BET', 'RAISE', 'ALL_IN',
+    # Sizing tokens
+    "STACK_SIZE",
+    "POT_SIZE",
+    "SB_SIZE",
+    "BB_SIZE",
     
-    # Stack Size Tokens
-    'STACK_SIZE',
-    
-    # Pot Size Tokens
-    'POT_SIZE',
-    
-    # Game State Tokens
-    'PREFLOP', 'FLOP', 'TURN', 'RIVER'
+    # Numeric tokens
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
 ]
 
-output_tokens = [
+# Note: The output decisions remain the same so that indices map consistently:
+output_decisions = [
     'FOLD',
     'PASSIVE_ACTION',  # Check or Call
-    'ALL_IN',
-    'BET_33',
-    'BET_50',
-    'BET_66',
-    'BET_90',
-    'BET_120',
-    'BET_150'
+    'BET'
 ]
 
-def load_model():    
+def load_model():
     try:
         model = tf.keras.models.load_model(model_path)
         return model
@@ -56,16 +65,14 @@ def load_model():
         model = create_model()
         return model
 
-import tensorflow as tf
-
 def create_model():
     # Adjustable parameters
-    transformer_depth = 1
-    feed_forward_units = 64
-    attention_key_dim = 12
-    attention_num_heads = 2
-    embedding_size = 64
-    
+    transformer_depth = 3          # Increased depth for better sequential understanding
+    feed_forward_units = 256       # Increased units for better feature learning
+    attention_key_dim = 32         # Increased key dimension for richer attention patterns
+    attention_num_heads = 8        # Standard number of attention heads
+    embedding_size = 128           # Larger embedding size for better token representation
+
     inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
     embedding = tf.keras.layers.Embedding(
         input_dim=len(vocabulary),
@@ -94,13 +101,13 @@ def create_model():
         transformer_output = transformer_block(transformer_output)
     
     global_avg_pool = tf.keras.layers.GlobalAveragePooling1D()(transformer_output)
-    outputs = tf.keras.layers.Dense(units=len(output_tokens), activation='softmax')(global_avg_pool)
+    outputs = tf.keras.layers.Dense(units=len(output_decisions), activation='softmax')(global_avg_pool)
     
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(),
-        loss='sparse_categorical_crossentropy',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+        loss='categorical_crossentropy',
         metrics=['accuracy']
     )
     
@@ -171,26 +178,8 @@ def encode_game_state(game, hero_idx):
 def pad_sequence(sequence):
     tokens = sequence.split()
     
-    if len(tokens) > max_sequence_length:
+    if len(tokens) >= max_sequence_length:
         tokens = tokens[:max_sequence_length]
-        return " ".join(tokens)
-    
-    return sequence + ' PAD' * (max_sequence_length - len(tokens))
-
-def encode_street_actions(actions, hero_idx, hero_position, opponent_position):
-    """Helper function to encode actions for a street."""
-    tokens = []
-    
-    for action in actions:
-        action_type = action["action"]
-        if action_type == "POST":
-            continue
-        
-        position = hero_position if action["player_idx"] == hero_idx else opponent_position
-        tokens.append(position)
-        
-        tokens.append(action_type)
-        if action_type in ["BET", "RAISE", "ALL_IN"]:
-            tokens.extend(amount_as_tokens(action["amount"]))
-    
-    return tokens
+    else:
+        tokens += ['PAD'] * (max_sequence_length - len(tokens))
+    return " ".join(tokens)

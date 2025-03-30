@@ -14,24 +14,27 @@
 ## Action Tokens
 - `FOLD`
 - `CHECK`
+- `POST`
 - `CALL`
 - `BET`
 - `RAISE`
 - `ALL_IN`
 
-## Stack Size Tokens (in octal)
+## Blind Size Tokens
+- `SB_SIZE`
+- `BB_SIZE`
+- Individual digits: `0`, `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`
+
+## Stack Size Tokens
 - `STACK_SIZE`
-- Individual octal digits: `0`, `1`, `2`, `3`, `4`, `5`, `6`, `7`
-- Examples:
-  - Stack of 100 (decimal) = `144` (octal)
-  - Stack of 1000 (decimal) = `1750` (octal)
+- Uses same digits as stack sizes
 
 ## Pot Size Tokens
 - `POT_SIZE`
-- Uses same octal digits as stack sizes
+- Uses same digits as stack sizes
 
-## Bet Size Tokens (in octal)
-- Uses same octal digits as stack sizes
+## Bet Size Tokens
+- Uses same digits as stack sizes
 
 ## Game State Tokens
 - `PREFLOP`
@@ -42,57 +45,45 @@
 ## Special Tokens
 - `EOS` (End of sequence)
 - `BOS` (Beginning of sequence)
-- `SDM` (Start decision making - when betting or raising a size is needed so multiple tokens are needed)
 
 ## Outputs
 - `FOLD`
 - `PASSIVE_ACTION` (Check or Call)
-- `START_AGGRESSIVE_ACTION` (Bet or Raise)
-- `END_AGGRESSIVE_ACTION`
+- `33` (Bet or Raise 33% of pot)
+- `50`
+- `66`
+- `90`
+- `120`
+- `150`
 - `ALL_IN`
-- `OCTAL_0`
-- `OCTAL_1`
-- `OCTAL_2`
-- `OCTAL_3`
-- `OCTAL_4`
-- `OCTAL_5`
-- `OCTAL_6`
-- `OCTAL_7`
-
-<br />
-<br />
-<br />
-
-# SDM usage
-
-The hero (BTN) has started raising over the previous bet from the BB. The raise is starting with (or simply is) the octal digit 6 (eg 6, 64 or 671)
-BOS BTN ... BB BET 2 SDM 6
 
 # Example Hand
+It's worth noting that when the sequence doesn't end on the river (eg halfway through the flop), it will still end with EOS
 
 ## Implied Information (No tokens)
-Blinds are 1/2
+Heads up only
 
 ## General Information
-Start the sequence, describe hero position, hero cards and effective stack size
+Start the sequence, describe hero position, hero cards, effective stack size and blinds
 
-`BOS BTN RANK_A SUIT_H RANK_A SUIT_C STACK_SIZE 1 4 4`
+`BOS BTN RANK_A SUIT_H RANK_A SUIT_C STACK_SIZE 2 0 0 SB_SIZE 1 BB_SIZE 2`
 
 ## Preflop
-Show alternating action with position and then the action (and an octal value if the action requires)
+Show alternating action with position and then the action (and a value if the action requires)
 
-`PREFLOP BB CHECK BTN BET 5 BB CALL`
+`PREFLOP BTN POST 1 BB POST 2 BTN RAISE 5 BB CALL 5`
 
 ## Flop
-Describe pot size and community cards, then action
+Describe pot size and community cards (3c, 9c, js), then action
 
-`FLOP POT_SIZE 1 2 RANK_3 SUIT_C RANK_9 SUIT_C RANK_J SUIT_S BB CHECK BTN BET 4 BB CALL`
+`FLOP POT_SIZE 1 0 RANK_3 SUIT_C RANK_9 SUIT_C RANK_J SUIT_S BB CHECK BTN BET 4 BB CALL 4`
 
 ## Turn
+Describe pot size and community cards (4s), then action
 
-`TURN POT_SIZE 2 2 RANK_4 SUIT_S BB CHECK BTN BET 7 BB RAISE 3 1 BTN CALL`
+`TURN POT_SIZE 1 8 RANK_4 SUIT_S BB CHECK BTN BET 7 BB RAISE 2 2 BTN CALL 2 2`
 
 ## River
-End the sequence at the end
+Describe pot size and community cards (4s), then action, then end sequence
 
-`RIVER POT_SIZE 1 0 4 RANK_T SUIT_S BB CHECK BTN CHECK EOS`
+`RIVER POT_SIZE 6 2 RANK_T SUIT_S BB CHECK BTN CHECK EOS`
