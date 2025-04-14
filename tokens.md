@@ -1,4 +1,4 @@
-# Streamlined GTO No-Limit Hold'em Transformer Token Set
+# No-Limit Hold'em Transformer Token Set
 
 ## Card Representation Tokens
 ### Rank Tokens (13)
@@ -49,19 +49,12 @@
 ## Outputs
 - `FOLD`
 - `PASSIVE_ACTION` (Check or Call)
-- `33` (Bet or Raise 33% of pot)
-- `50`
-- `66`
-- `90`
-- `120`
-- `150`
+- `BET_20` (Bet or Raise 20% of pot)
+- `BET_100`
 - `ALL_IN`
 
 # Example Hand
-It's worth noting that when the sequence doesn't end on the river (eg halfway through the flop), it will still end with EOS
-
-## Implied Information (No tokens)
-Heads up only
+It's worth noting that when the sequence doesn't end on the river (eg halfway through the flop), it will still end with `EOS`
 
 ## General Information
 Start the sequence, describe hero position, hero cards, effective stack size and blinds
