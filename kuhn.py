@@ -1,8 +1,5 @@
-# kuhn.py
 import numpy as np
 from cfr import GameState, CFRSolver, MonteCarloDeepCFRSolver
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, Dense, Flatten, Dropout
 
 # ---------------------------------------------------------------------
 # Kuhn Poker GameState
@@ -76,22 +73,6 @@ class KuhnPokerState(GameState):
         return f"{self.player_cards[cp]} {self.history}".strip()
 
 # ---------------------------------------------------------------------
-# Model builder for Deep CFR
-# ---------------------------------------------------------------------
-def create_model(input_vocabulary, output_decisions):
-    vocab_size = len(input_vocabulary)
-    output_size = len(output_decisions)
-    model = Sequential([
-        Embedding(input_dim=vocab_size + 1, output_dim=16),
-        Flatten(),
-        Dense(64, activation='relu'),
-        Dropout(0.2),
-        Dense(32, activation='relu'),
-        Dense(output_size)
-    ])
-    return model
-
-# ---------------------------------------------------------------------
 # Training and comparison
 # ---------------------------------------------------------------------
 if __name__ == '__main__':
@@ -101,32 +82,46 @@ if __name__ == '__main__':
 
     tabular_root = KuhnPokerState()
     tabular_solver = CFRSolver(tabular_root)
-    
     tabular_solver.load("models/kuhn.pkl")
-    # tabular_solver.train(iterations=1000)
-    # tabular_solver.save("models/kuhn.pkl")
-
 
     deep_root = KuhnPokerState()
-    deep_model = create_model(input_vocabulary, output_decisions)
-    deep_solver = MonteCarloDeepCFRSolver(deep_root, deep_model, input_vocabulary, output_decisions, max_input_length)
+    deep_solver = MonteCarloDeepCFRSolver(
+        root_state=deep_root,
+        input_vocabulary=input_vocabulary,
+        output_decisions=output_decisions,
+        max_input_length=max_input_length
+    )
+
+    try:
+        deep_solver.load("models")
+    except:
+        print("No existing model found, starting fresh training")
     
-    # deep_solver.load("models/model-APR-14.keras")
-    deep_solver.train(iterations=50, simulations_per_iteration=1000, batch_size=256, epochs=10)
-    deep_solver.save("models/model-APR-14.keras")
+    # Training parameters
+    sessions = 5
+    iterations = 10
+    traversals_per_iter = 1000
+    batch_size = 256
+    epochs = 10
+    
+    # Split training into sessions
+    for session in range(sessions):
+        print(f"\nTraining Session {session + 1}/{sessions}")
+        deep_solver.train(iterations, traversals_per_iter, batch_size, epochs)
+        deep_solver.save("models")
 
-    # Evaluate strategies
-    infosets = [
-        "J", "Q", "K",
-        "J ACTION_P", "Q ACTION_P", "K ACTION_P",
-        "J ACTION_B", "Q ACTION_B", "K ACTION_B",
-        "J ACTION_P ACTION_B", "Q ACTION_P ACTION_B", "K ACTION_P ACTION_B"
-    ]
+        # Evaluate strategies after each session
+        infosets = [
+            "J", "Q", "K",
+            "J ACTION_P", "Q ACTION_P", "K ACTION_P", 
+            "J ACTION_B", "Q ACTION_B", "K ACTION_B",
+            "J ACTION_P ACTION_B", "Q ACTION_P ACTION_B", "K ACTION_P ACTION_B"
+        ]
 
-    print("\nComparison of Strategies (Deep CFR vs. Tabular CFR):\n" + "-" * 80)
-    for info_set in infosets:
-        legal_actions = ["ACTION_P", "ACTION_B"]
-        deep_strategy = deep_solver.get_strategy(info_set, legal_actions)
-        tabular_strategy = tabular_solver.get_average_strategy(info_set, legal_actions)
-        print(f"InfoSet: {info_set:<25} | Deep: P={deep_strategy['ACTION_P']:.2f}, B={deep_strategy['ACTION_B']:.2f} | Tabular: P={tabular_strategy['ACTION_P']:.2f}, B={tabular_strategy['ACTION_B']:.2f}")
-    print("-" * 80)
+        print(f"\nStrategy Comparison after Session {session + 1}:\n" + "-" * 78)
+        for info_set in infosets:
+            legal_actions = ["ACTION_P", "ACTION_B"]
+            deep_strategy = deep_solver.get_average_strategy(info_set, legal_actions)
+            tabular_strategy = tabular_solver.get_average_strategy(info_set, legal_actions)
+            print(f"InfoSet: {info_set:<20} | Deep: P={deep_strategy['ACTION_P']:.2f}, B={deep_strategy['ACTION_B']:.2f} | Tabular: P={tabular_strategy['ACTION_P']:.2f}, B={tabular_strategy['ACTION_B']:.2f}")
+        print("-" * 78)
