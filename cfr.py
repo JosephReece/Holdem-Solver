@@ -3,31 +3,83 @@ import random
 import numpy as np
 import tensorflow as tf
 import pickle
-from collections import defaultdict
+from collections import defaultdict, deque
+from model import RegretNet, StrategyNet
 
 # ---------------------------------------------------------------------
 # Abstract GameState Interface
 # ---------------------------------------------------------------------
 class GameState:
+    """
+    Abstract Base Class for a game state.
+
+    This class defines the interface for all game states. All methods below should be implemented by subclasses.
+    """
+
     def is_terminal(self):
+        """
+        Determine whether the state is terminal.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def current_player(self):
+        """
+        Get the index of the current player.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def legal_player_actions(self):
+        """
+        Return the list of legal actions available to the current player.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def legal_chance_outcomes(self):
+        """
+        Return the list of legal chance outcomes.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def next_state(self, action):
+        """
+        Compute the next state given the current state and an action.
+
+        Args:
+            action: The action or chance outcome applied in the current state.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def utility(self):
+        """
+        Calculate the utility (payoffs) for the terminal state.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
     def information_set(self):
+        """
+        Return the information set for the current state as perceived by the current player.
+
+        Raises:
+            NotImplementedError: This method must be implemented by the subclass.
+        """
         raise NotImplementedError
 
 # ---------------------------------------------------------------------
@@ -118,85 +170,35 @@ class CFRSolver:
 # ---------------------------------------------------------------------
 # Monte Carlo Deep CFR Solver
 # ---------------------------------------------------------------------
-import random
-import numpy as np
-import tensorflow as tf
-from collections import defaultdict, deque
-
-@tf.keras.utils.register_keras_serializable()
-class RegretNet(tf.keras.Model):
-    def __init__(self, input_dim, output_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.model = tf.keras.Sequential([
-            tf.keras.layers.InputLayer(shape=(input_dim,)),
-            tf.keras.layers.Dense(128, activation='relu'),
-            tf.keras.layers.Dense(128, activation='relu'),
-            tf.keras.layers.Dense(output_dim)
-        ])
-
-    def call(self, x):
-        return self.model(x)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-        })
-        return config
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-@tf.keras.utils.register_keras_serializable()
-class StrategyNet(tf.keras.Model):
-    def __init__(self, input_dim, output_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.model = tf.keras.Sequential([
-            tf.keras.layers.InputLayer(shape=(input_dim,)),
-            tf.keras.layers.Dense(128, activation='relu'),
-            tf.keras.layers.Dense(128, activation='relu'),
-            tf.keras.layers.Dense(output_dim, activation='softmax')
-        ])
-
-    def call(self, x):
-        return self.model(x)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-        })
-        return config
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-    
 class MonteCarloDeepCFRSolver:
     def __init__(self, root_state, input_vocabulary, output_decisions, max_input_length):
         self.root_state = root_state
         self.input_vocabulary = {token: i + 1 for i, token in enumerate(input_vocabulary)}
         self.output_decisions = output_decisions
         self.max_input_length = max_input_length
-        self.input_dim = max_input_length
         self.output_dim = len(output_decisions)
 
-        self.regret_nets = [RegretNet(self.input_dim, self.output_dim) for _ in range(2)]
-        self.strategy_net = StrategyNet(self.input_dim, self.output_dim)
+        # Fill in blanks
+        self.regret_nets = [
+            RegretNet(
+                vocab_size=len(self.input_vocabulary),
+                max_len=self.max_input_length,
+                output_dim=self.output_dim
+            ) for _ in range(2)
+        ]
+
+        self.strategy_net = StrategyNet(
+            vocab_size=len(self.input_vocabulary),
+            max_len=self.max_input_length,
+            output_dim=self.output_dim
+        )
 
         # Compile the networks
         for net in self.regret_nets:
-            net.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01),
+            net.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
                    loss=tf.keras.losses.MeanSquaredError())
         
-        self.strategy_net.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01),
+        self.strategy_net.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
                 loss=tf.keras.losses.CategoricalCrossentropy())
 
         self.regret_memory = [deque(maxlen=100000) for _ in range(2)]
@@ -206,7 +208,7 @@ class MonteCarloDeepCFRSolver:
         tokens = info_set.split()
         indices = [self.input_vocabulary.get(tok, 0) for tok in tokens]
         indices = [0] * (self.max_input_length - len(indices)) + indices[-self.max_input_length:]
-        return tf.convert_to_tensor([indices], dtype=tf.float32)
+        return tf.convert_to_tensor([indices], dtype=tf.int32)  # updated to int32 for embeddings
 
     def traverse(self, state, player, traversing_player, pi=1.0):
         if state.is_terminal():

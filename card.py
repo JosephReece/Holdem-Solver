@@ -243,9 +243,7 @@ def canonicalize_hand(hole_cards, board_cards):
     sorted_hole = sort_by_rank(hole_cards)
     sorted_flop = sort_by_rank(flop)
 
-    all_cards = sorted_hole + sorted_flop + turn + river
-
-    # Suit mapping
+    # Suit mapping 
     suit_map = {}
     next_suit_id = 1
 
@@ -256,8 +254,15 @@ def canonicalize_hand(hole_cards, board_cards):
             next_suit_id += 1
         return suit_map[suit]
 
-    canonical_strings = [
-        f"{card.rank}{map_suit(card.suit)}" for card in all_cards
-    ]
+    # Create canonical string for each street
+    def format_cards(cards):
+        return ' '.join(f"RANK_{card.rank} SUIT_{map_suit(card.suit)}" for card in cards)
 
-    return ",".join(canonical_strings)
+    canonical = {
+        'hole': format_cards(sorted_hole),
+        'flop': format_cards(sorted_flop),
+        'turn': format_cards(turn),
+        'river': format_cards(river)
+    }
+
+    return canonical

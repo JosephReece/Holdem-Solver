@@ -1,5 +1,7 @@
+# kuhn.py
 import numpy as np
 from cfr import GameState, CFRSolver, MonteCarloDeepCFRSolver
+import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------
 # Kuhn Poker GameState
@@ -101,8 +103,11 @@ if __name__ == '__main__':
     sessions = 5
     iterations = 10
     traversals_per_iter = 1000
-    batch_size = 256
+    batch_size = 512
     epochs = 10
+    
+    # Track differences across sessions
+    strategy_differences = []
     
     # Split training into sessions
     for session in range(sessions):
@@ -118,10 +123,33 @@ if __name__ == '__main__':
             "J ACTION_P ACTION_B", "Q ACTION_P ACTION_B", "K ACTION_P ACTION_B"
         ]
 
+        # Calculate average difference for this session
+        total_diff = 0
+        comparisons = 0
+        
         print(f"\nStrategy Comparison after Session {session + 1}:\n" + "-" * 78)
         for info_set in infosets:
             legal_actions = ["ACTION_P", "ACTION_B"]
             deep_strategy = deep_solver.get_average_strategy(info_set, legal_actions)
             tabular_strategy = tabular_solver.get_average_strategy(info_set, legal_actions)
+            
+            # Calculate difference between strategies
+            diff = sum(abs(deep_strategy[a] - tabular_strategy[a]) for a in legal_actions)
+            total_diff += diff
+            comparisons += len(legal_actions)
+            
             print(f"InfoSet: {info_set:<20} | Deep: P={deep_strategy['ACTION_P']:.2f}, B={deep_strategy['ACTION_B']:.2f} | Tabular: P={tabular_strategy['ACTION_P']:.2f}, B={tabular_strategy['ACTION_B']:.2f}")
+        
+        avg_diff = total_diff / comparisons
+        strategy_differences.append(avg_diff)
         print("-" * 78)
+
+    # Plot the results
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, sessions + 1), strategy_differences, marker='o')
+    plt.title('Strategy Convergence Over Training Sessions')
+    plt.xlabel('Training Session')
+    plt.ylabel('Average Strategy Difference')
+    plt.grid(True)
+    plt.savefig('training_convergence.png')
+    plt.show()

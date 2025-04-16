@@ -1,122 +1,88 @@
 import tensorflow as tf
 
-model_path = "models/model.keras"
-max_sequence_length = 10
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super().__init__()
+        self.att = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = tf.keras.Sequential([
+            tf.keras.layers.Dense(ff_dim, activation="relu"),
+            tf.keras.layers.Dense(embed_dim)
+        ])
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = tf.keras.layers.Dropout(rate)
+        self.dropout2 = tf.keras.layers.Dropout(rate)
 
-# Token set for No-Limit Hold'em GTO Solver
-vocabulary = [
-    # Special tokens
-    "PAD",  # Padding Token
-    "BOS",  # Beginning of sequence
-    "EOS",  # End of sequence
-    
-    # Rank tokens (13)
-    "RANK_2", "RANK_3", "RANK_4", "RANK_5", "RANK_6", 
-    "RANK_7", "RANK_8", "RANK_9", "RANK_T", "RANK_J", 
-    "RANK_K", "RANK_Q", "RANK_A",
-    
-    # Suit tokens (4)
-    "SUIT_C",  # Clubs
-    "SUIT_D",  # Diamonds
-    "SUIT_H",  # Hearts
-    "SUIT_S",  # Spades
-    
-    # Position tokens
-    "BTN",  # Button
-    "BB",   # Big Blind
-    
-    # Action tokens
-    "FOLD",
-    "CHECK",
-    "POST",
-    "CALL",
-    "BET",
-    "RAISE",
-    "ALL_IN", # Use this instead of call, bet and raise when a player goes all in
-    
-    # Game state tokens
-    "PREFLOP",
-    "FLOP",
-    "TURN",
-    "RIVER",
-    
-    # Sizing tokens
-    "STACK_SIZE",
-    "POT_SIZE",
-    "SB_SIZE",
-    "BB_SIZE",
-    
-    # Numeric tokens
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-]
+    def call(self, inputs, training):
+        attn_output = self.att(inputs, inputs)
+        out1 = self.layernorm1(inputs + self.dropout1(attn_output, training=training))
+        ffn_output = self.ffn(out1)
+        return self.layernorm2(out1 + self.dropout2(ffn_output, training=training))
 
-# Outputs for the network 
-output_decisions = [
-    'FOLD',
-    'PASSIVE_ACTION', #Check or Call
-    'BET_20', #Bet 20% of pot, or raise 20% of the pot
-    'BET_100',
-    'ALL_IN'
-]
+@tf.keras.utils.register_keras_serializable()
+class RegretNet(tf.keras.Model):
+    def __init__(self, vocab_size, max_len, output_dim, embed_dim=32, num_heads=2, ff_dim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.embedding = tf.keras.layers.Embedding(vocab_size + 1, embed_dim)
+        self.pos_encoding = tf.keras.layers.Embedding(input_dim=max_len, output_dim=embed_dim)
+        self.transformer = TransformerBlock(embed_dim, num_heads, ff_dim)
+        self.pooling = tf.keras.layers.GlobalAveragePooling1D()
+        self.out_proj = tf.keras.layers.Dense(output_dim)
 
-def load_model():
-    try:
-        model = tf.keras.models.load_model(model_path)
-        return model
-    except:
-        model = create_model()
-        return model
+        self.max_len = max_len
+        self.output_dim = output_dim
+        self.vocab_size = vocab_size
 
-def create_model(vocabulary, output_decisions):
-    # Adjustable parameters
-    transformer_depth = 1
-    feed_forward_units = 64
-    attention_key_dim = 16
-    attention_num_heads = 2
-    embedding_size = 32
+    def call(self, x, training=False):
+        positions = tf.range(start=0, limit=self.max_len, delta=1)
+        x = self.embedding(x) + self.pos_encoding(positions)
+        x = self.transformer(x, training=training)
+        x = self.pooling(x)
+        return self.out_proj(x)
 
-    inputs = tf.keras.layers.Input(shape=(max_sequence_length,), dtype=tf.int32)
-    embedding = tf.keras.layers.Embedding(
-        input_dim=len(vocabulary),
-        output_dim=embedding_size
-    )(inputs)
-    
-    def transformer_block(input_layer):
-        # Multi-head attention
-        attention = tf.keras.layers.MultiHeadAttention(
-            num_heads=attention_num_heads,
-            key_dim=attention_key_dim
-        )(input_layer, input_layer)
-        
-        # Add & Norm
-        add_norm1 = tf.keras.layers.LayerNormalization()(tf.keras.layers.Add()([input_layer, attention]))
-        
-        # Feed Forward Network
-        feed_forward = tf.keras.layers.Dense(units=feed_forward_units, activation='relu')(add_norm1)
-        feed_forward_output = tf.keras.layers.Dense(units=embedding_size)(feed_forward)
-        
-        # Add & Norm
-        return tf.keras.layers.LayerNormalization()(tf.keras.layers.Add()([add_norm1, feed_forward_output]))
-    
-    transformer_output = embedding
-    for _ in range(transformer_depth):
-        transformer_output = transformer_block(transformer_output)
-    
-    global_avg_pool = tf.keras.layers.GlobalAveragePooling1D()(transformer_output)
-    outputs = tf.keras.layers.Dense(units=len(output_decisions), activation='softmax')(global_avg_pool)
-    
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    return model
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "vocab_size": self.vocab_size,
+            "max_len": self.max_len,
+            "output_dim": self.output_dim
+        })
+        return config
 
-def save_model(model):
-    model.save(model_path)
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
-def card_as_tokens(card):
-    return ["RANK_" + card.rank, "SUIT_" + card.suit[0]]
+@tf.keras.utils.register_keras_serializable()
+class StrategyNet(tf.keras.Model):
+    def __init__(self, vocab_size, max_len, output_dim, embed_dim=32, num_heads=2, ff_dim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.embedding = tf.keras.layers.Embedding(vocab_size + 1, embed_dim)
+        self.pos_encoding = tf.keras.layers.Embedding(input_dim=max_len, output_dim=embed_dim)
+        self.transformer = TransformerBlock(embed_dim, num_heads, ff_dim)
+        self.pooling = tf.keras.layers.GlobalAveragePooling1D()
+        self.out_proj = tf.keras.layers.Dense(output_dim, activation="softmax")
+
+        self.max_len = max_len
+        self.output_dim = output_dim
+        self.vocab_size = vocab_size
+
+    def call(self, x, training=False):
+        positions = tf.range(start=0, limit=self.max_len, delta=1)
+        x = self.embedding(x) + self.pos_encoding(positions)
+        x = self.transformer(x, training=training)
+        x = self.pooling(x)
+        return self.out_proj(x)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "vocab_size": self.vocab_size,
+            "max_len": self.max_len,
+            "output_dim": self.output_dim
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
