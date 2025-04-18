@@ -1,484 +1,414 @@
-"""
-holdem.py
-
-NLHE Heads-up (100BBs deep, 1/2) deep MCCFR solver that maintains player information
-in a list of dictionaries. Each player dictionary contains:
-  - "stack": the current chip count (in BBs)
-  - "cards": a list of Card objects representing the hole cards (empty if not yet dealt)
-  - "all_in": a boolean indicating if the player is all in
-
-This version also tokenizes the game history (stored as a dictionary for each betting street)
-into a string via the information_set() method following these tokenization rules:
-
-  • General Information:
-      BOS <HERO_POSITION> <HERO_CARD1> <HERO_CARD2> STACK_SIZE <stack digits> SB_SIZE <sb digits> BB_SIZE <bb digits>
-  • PREFLOP:
-      PREFLOP <action tokens>  (e.g., BTN POST 1, BB POST 2, BTN RAISE 5, BB CALL 5)
-  • FLOP:
-      FLOP POT_SIZE <pot digits> <3 board cards> <flop action tokens>
-  • TURN:
-      TURN POT_SIZE <pot digits> <turn card> <turn action tokens>
-  • RIVER:
-      RIVER POT_SIZE <pot digits> <river card> <river action tokens> EOS
-
-The deep solver (MonteCarloDeepCFRSolver) is used exclusively.
-Dependencies from card.py (Card, Deck, rank_order, suits, hand_ranks, compare_hands, calculate_equity, canonicalize_hand)
-and the CFR module (GameState, MonteCarloDeepCFRSolver) are assumed to be available.
-"""
-
+import random
+import time
 import numpy as np
 import matplotlib.pyplot as plt
+
 from cfr import GameState, MonteCarloDeepCFRSolver
-from card import Card, Deck, rank_order, suits, hand_ranks, compare_hands, calculate_equity, canonicalize_hand
+from card import (
+    Card, Deck, rank_order, rank_value, suits, hand_ranks,
+    compare_hands, calculate_equity, canonicalize_hand
+)
+
+import sys
+sys.setrecursionlimit(1000)
 
 # ---------------------------------------------------------------------
-# Token definitions
+# Game Parameters
+# ---------------------------------------------------------------------
+INITIAL_STACK = 200
+SB_AMOUNT = 1
+BB_AMOUNT = 2
+
+# ---------------------------------------------------------------------
+# NLHEState Class
+# ---------------------------------------------------------------------
+class NLHEState(GameState):
+    def __init__(self, players=None, board=None, current_street="PREFLOP", history=None, is_chance=False):
+        if players is None:
+            deck = Deck()
+            hole_cards = [deck.draw_cards(2), deck.draw_cards(2)]
+            self.players = {
+                0: {"stack": INITIAL_STACK - SB_AMOUNT, "contribution": SB_AMOUNT, "hole_cards": hole_cards[0], "all_in": False},
+                1: {"stack": INITIAL_STACK - BB_AMOUNT, "contribution": BB_AMOUNT, "hole_cards": hole_cards[1], "all_in": False}
+            }
+            self.is_chance_node = False
+        else:
+            self.players = players
+            self.is_chance_node = is_chance
+
+        self.board = board if board is not None else []
+        self.current_street = current_street
+        self.history = history if history is not None else {s: [] for s in ["PREFLOP", "FLOP", "TURN", "RIVER"]}
+
+        self.pot = self.players[0]["contribution"] + self.players[1]["contribution"]
+        self.current_bet = self._extract_current_bet()
+        self.raise_count = self._extract_raise_count()
+
+    def _extract_current_bet(self):
+        actions = self.history[self.current_street]
+        for action in reversed(actions):
+            if action[1].startswith("BET") or action[1] == "ALL_IN":
+                return action[2]
+        return 0
+
+    def _extract_raise_count(self):
+        return sum(1 for a in self.history[self.current_street] if a[1].startswith("BET") or a[1] == "ALL_IN")
+
+    def is_chance(self):
+        return self.is_chance_node
+
+    def is_terminal(self):
+        if any("FOLD" == a[1] for s in self.history.values() for a in s):
+            return True
+        if self.players[0]["all_in"] and self.players[1]["all_in"]:
+            return True
+        if self.current_street == "RIVER" and self.history["RIVER"] and self.history["RIVER"][-1][1] in ["CALL", "CHECK", "FOLD", "ALL_IN"]:
+            return True
+        return False
+
+    def current_player(self):
+        if self.is_chance() or self.is_terminal():
+            return None
+        starting_player = 0 if self.current_street == "PREFLOP" else 1
+        num_actions = len(self.history[self.current_street])
+        return (starting_player + num_actions) % 2
+
+    def legal_player_actions(self):
+        if self.is_chance() or self.is_terminal():
+            return []
+
+        if self.current_street == "PREFLOP":
+            # No actions yet - BTN's first action
+            if not self.history["PREFLOP"]:
+                return ["FOLD", "CALL", "BET_100"]  # Lock no rips to start
+            
+            # Handle raises based on raise count
+            if self.raise_count < 4: # Allow another raise
+                return ["FOLD", "CALL", "BET_100", "ALL_IN"]
+            else: # After 4-bet, only all-in, call or fold
+                return ["FOLD", "CALL", "ALL_IN"]
+
+        else: # FLOP, TURN, RIVER
+            # First action in street
+            defaults = ["CHECK", "BET_20", "BET_100", "ALL_IN"]
+            if not self.history[self.current_street]:
+                return defaults
+            
+            last_action = self.history[self.current_street][-1][1]
+            if last_action == "CHECK":
+                return defaults
+            
+            if last_action in ["BET_20", "BET_100"]:
+                return ["FOLD", "CALL", "ALL_IN"] # Can only all-in as raise
+            elif last_action == "ALL_IN":
+                return ["FOLD", "CALL"]
+            
+        print(self.current_street)
+        print(self.history)
+
+    def next_state_from_chance(self):
+        used_cards = [card for p in self.players.values() for card in p["hole_cards"]] + self.board
+        deck = Deck(without=used_cards)
+        new_board = self.board.copy()
+
+        if self.current_street == "PREFLOP":
+            new_board += deck.draw_cards(3)
+            new_street = "FLOP"
+        elif self.current_street == "FLOP":
+            new_board += deck.draw_cards(1)
+            new_street = "TURN"
+        elif self.current_street == "TURN":
+            new_board += deck.draw_cards(1)
+            new_street = "RIVER"
+        else:
+            raise ValueError("No chance move available from RIVER.")
+
+        return NLHEState(
+            players=self._copy_players(),
+            board=new_board,
+            current_street=new_street,
+            history={k: v.copy() for k, v in self.history.items()},  # Preserve history
+            is_chance=False
+        )
+
+    def next_state_from_action(self, action):
+        if self.is_chance():
+            raise ValueError("Cannot call next_state_from_action on a chance node.")
+
+        acting_player = self.current_player()
+        new_history = {k: v.copy() for k, v in self.history.items()}
+        new_players = self._copy_players()
+        pot = self.pot
+
+        if action == "FOLD":
+            new_history[self.current_street].append((acting_player, "FOLD", 0))
+        elif action == "CHECK":
+            new_history[self.current_street].append((acting_player, "CHECK", 0))
+        elif action == "CALL":
+            call_amount = int(self.current_bet)
+            new_players[acting_player]["stack"] -= call_amount
+            new_players[acting_player]["contribution"] += call_amount
+            pot += call_amount
+            new_history[self.current_street].append((acting_player, "CALL", call_amount))
+        elif action in ["BET_20", "BET_100"]:
+            bet_amount = int(0.2 * pot) if action == "BET_20" else pot
+            new_players[acting_player]["stack"] -= bet_amount
+            new_players[acting_player]["contribution"] += bet_amount
+            pot += bet_amount
+            new_history[self.current_street].append((acting_player, action, bet_amount))
+        elif action == "ALL_IN":
+            all_in_amount = new_players[acting_player]["stack"]
+            new_players[acting_player]["stack"] = 0
+            new_players[acting_player]["contribution"] += all_in_amount
+            pot += all_in_amount
+            new_players[acting_player]["all_in"] = True
+            new_history[self.current_street].append((acting_player, "ALL_IN", all_in_amount))
+        else:
+            raise ValueError("Invalid action")
+
+        # Check for end-of-street conditions
+        street_actions = new_history[self.current_street]
+        if self.current_street != "RIVER" and len(street_actions) >= 2:
+            last_action = street_actions[-1][1]
+            second_last_action = street_actions[-2][1]
+
+            both_all_in = new_players[0]["all_in"] and new_players[1]["all_in"]
+            if (last_action == "CALL" or (last_action == "CHECK" and second_last_action == "CHECK")) or both_all_in:
+                return NLHEState(
+                    players=new_players,
+                    board=self.board.copy(),
+                    current_street=self.current_street,
+                    history=new_history,
+                    is_chance=True  # Proceed to chance node
+                )
+
+        return NLHEState(
+            players=new_players,
+            board=self.board.copy(),
+            current_street=self.current_street,
+            history=new_history,
+            is_chance=False
+        )
+
+    def utility(self):
+        all_actions = [a for actions in self.history.values() for a in actions]
+        pot = self.pot
+        if any(a[1] == "FOLD" for a in all_actions):
+            last_action = all_actions[-1]
+            folded_player = last_action[0]
+            winner = 1 - folded_player
+            return (pot, -pot) if winner == 0 else (-pot, pot)
+
+        if self.players[0]["all_in"] and self.players[1]["all_in"] and self.current_street != "RIVER":
+            equity = calculate_equity(self.players[0]["hole_cards"], self.players[1]["hole_cards"], self.board)
+            return (pot * (2 * equity - 1), -pot * (2 * equity - 1))
+
+        result = compare_hands(self.players[0]["hole_cards"] + self.board, self.players[1]["hole_cards"] + self.board)
+        if result == "Player 1":
+            return (pot, -pot)
+        elif result == "Player 2":
+            return (-pot, pot)
+        else:
+            return (0, 0)
+
+    def information_set(self):
+        current_player_index = self.current_player()
+        if current_player_index is None:
+            return "EOS"
+
+        canonical = canonicalize_hand(self.players[current_player_index]["hole_cards"], self.board)
+        hole = canonical["hole"]
+
+        tokens = [
+            "BOS",
+            "BTN" if current_player_index == 0 else "BB",
+            hole,
+            "STACK_SIZE", *list(str(self.players[current_player_index]["stack"])),
+            "SB_SIZE", *list(str(SB_AMOUNT)),
+            "BB_SIZE", *list(str(BB_AMOUNT))
+        ]
+
+        streets = ["PREFLOP", "FLOP", "TURN", "RIVER"]
+        current_street_index = streets.index(self.current_street)
+        for street in streets[:current_street_index + 1]:
+            if not self.history[street] and street != self.current_street:
+                continue
+            tokens.append(street)
+
+            if street == "PREFLOP":
+                tokens += ["BTN", "POST", *list(str(SB_AMOUNT)), "BB", "POST", *list(str(BB_AMOUNT))]
+            else:
+                pot = sum(p["contribution"] for p in self.players.values())
+                pot_tokens = list(str(int(pot)))
+                tokens += ["POT_SIZE", *pot_tokens, *canonical[street.lower()].split(" ")]
+
+            for action in self.history[street]:
+                position = "BTN" if action[0] == 0 else "BB"
+                act = action[1]
+                amt = list(str(int(action[2]))) if action[2] > 0 else []
+                tokens += [position, act] + amt
+
+        tokens.append("EOS")
+        return " ".join(tokens)
+
+    def _copy_players(self):
+        return {
+            i: {
+                "stack": p["stack"],
+                "contribution": p["contribution"],
+                "hole_cards": p["hole_cards"].copy(),
+                "all_in": p["all_in"]
+            } for i, p in self.players.items()
+        }
+
+# ---------------------------------------------------------------------
+# Training and Evaluation
 # ---------------------------------------------------------------------
 
-# Input vocabulary tokens
-vocabulary = [
+input_vocabulary =  [
     # Special tokens
-    "PAD",  # Padding Token
-    "BOS",  # Beginning of sequence
-    "EOS",  # End of sequence
-    
-    # Rank tokens (13)
+    "PAD", "BOS", "EOS",
+    # Ranks
     "RANK_2", "RANK_3", "RANK_4", "RANK_5", "RANK_6", 
     "RANK_7", "RANK_8", "RANK_9", "RANK_T", "RANK_J", 
     "RANK_K", "RANK_Q", "RANK_A",
-    
-    # Suit tokens (4)
+    # Suits
     "SUIT_1", "SUIT_2", "SUIT_3", "SUIT_4",
-    
-    # Position tokens
-    "BTN",  # Button
-    "BB",   # Big Blind
-    
-    # Action tokens
-    "FOLD",
-    "CHECK",
-    "POST",
-    "CALL",
-    "BET",
-    "RAISE",
-    "ALL_IN",  # Use this instead of call, bet and raise when a player goes all in
-    
-    # Game state tokens
-    "PREFLOP",
-    "FLOP",
-    "TURN",
-    "RIVER",
-    
-    # Sizing tokens
-    "STACK_SIZE",
-    "POT_SIZE",
-    "SB_SIZE",
-    "BB_SIZE",
-    
+    # Positions
+    "BTN", "BB",
+    # Actions
+    "FOLD", "CHECK", "POST", "CALL", "BET_20", "BET_100", "ALL_IN",
+    # Streets and sizes
+    "PREFLOP", "FLOP", "TURN", "RIVER",
+    "STACK_SIZE", "POT_SIZE", "SB_SIZE", "BB_SIZE",
     # Numeric tokens
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
 ]
 
-output_decisions = [
-    'FOLD',
-    'PASSIVE_ACTION',  # Represents CALL or CHECK (decided by context)
-    'BET_20',          # In preflop: a pot–sized raise; later: a 20% pot bet
-    'BET_100',         # 100% pot bet (only later when no bet yet on street)
-    'ALL_IN'
-]
+output_decisions = ['FOLD', 'CHECK', 'CALL', 'BET_20', 'BET_100', 'ALL_IN']
 
-# ---------------------------------------------------------------------
-# NLHEState Class (using players as a list of dictionaries)
-# ---------------------------------------------------------------------
-class NLHEState(GameState):
-    def __init__(self, phase="CHANCE_HOLE", players=None, board_cards=None,
-                 pot=0, history=None, bet_count=0, current_street=None,
-                 next_player=0, sb=1, bb=2):
-        """
-        phase: current phase (e.g., "PREFLOP", "FLOP", "TURN", "RIVER", "TERMINAL")
-        players: list of dictionaries, one per player; each dict has keys "stack", "cards", and "all_in"
-                 If not provided, initializes two players with 100BB each, no cards, not all in.
-        board_cards: list of Card objects on the board
-        pot: current pot size
-        history: dictionary with keys "PREFLOP", "FLOP", "TURN", "RIVER" (each a list of tokenized action strings)
-        bet_count: number of raises on the current street
-        current_street: betting round indicator (e.g., "PREFLOP", "FLOP", etc.)
-        next_player: index (0 for BTN, 1 for BB) of the player to act
-        sb, bb: blind sizes
-        """
-        self.phase = phase
-        self.players = players if players is not None else [
-            {"stack": 100.0, "cards": [], "all_in": False},
-            {"stack": 100.0, "cards": [], "all_in": False}
-        ]
-        self.board_cards = board_cards if board_cards is not None else []
-        self.pot = pot
-        self.history = history if history is not None else {"PREFLOP": [], "FLOP": [], "TURN": [], "RIVER": []}
-        self.bet_count = bet_count
-        self.current_street = current_street  # e.g., "PREFLOP"
-        self.next_player = next_player
-        self.sb = sb
-        self.bb = bb
-
-    def is_terminal(self):
-        return self.phase == "TERMINAL"
-
-    def current_player(self):
-        if self.is_terminal() or self.phase.startswith("CHANCE"):
-            return None
-        return self.next_player
-
-    def legal_chance_outcomes(self):
-        if self.phase == "CHANCE_HOLE":
-            return []  # Sampling used in practice
-        elif self.phase in ["CHANCE_FLOP", "CHANCE_TURN", "CHANCE_RIVER"]:
-            return []
-        return []
-
-    def legal_player_actions(self):
-        actions = ["FOLD", "PASSIVE_ACTION"]
-        if self.current_street == "PREFLOP":
-            if self.bet_count == 0:
-                actions.append("BET_20")
-            else:
-                if self.bet_count < 4:
-                    actions.append("BET_20")
-                else:
-                    actions.append("ALL_IN")
-        else:
-            if not self.history[self.current_street]:
-                actions.append("BET_20")
-                actions.append("BET_100")
-            else:
-                actions.append("ALL_IN")
-        return actions
-
-    def record_action(self, action):
-        """
-        Converts the internal action to a token string and records it in the history for the current street.
-        For illustration (with dummy bet amounts):
-          - "FOLD" -> "FOLD"
-          - "PASSIVE_ACTION" -> "CHECK" if no bet exists, else "CALL 5"
-          - "BET_20" -> "RAISE 5" in preflop; "BET 4" later
-          - "BET_100" -> "BET 8"
-          - "ALL_IN" -> "ALL_IN"
-        The acting player's position (BTN/BB) is prepended.
-        """
-        pos = "BTN" if self.next_player == 0 else "BB"
-        if action == "FOLD":
-            token_str = "FOLD"
-        elif action == "PASSIVE_ACTION":
-            token_str = "CALL 5" if self.history[self.current_street] else "CHECK"
-        elif action == "BET_20":
-            token_str = "RAISE 5" if self.current_street == "PREFLOP" else "BET 4"
-        elif action == "BET_100":
-            token_str = "BET 8"
-        elif action == "ALL_IN":
-            token_str = "ALL_IN"
-        else:
-            token_str = action
-
-        tokenized_action = pos + " " + token_str
-        if self.current_street in self.history:
-            self.history[self.current_street].append(tokenized_action)
-
-    def next_state(self, action):
-        """
-        Returns a new state after applying the given action.
-          - Records the tokenized action in the appropriate street.
-          - Updates players' stacks, the pot, and bet counts.
-          - Advances the phase/round if appropriate.
-        """
-        # Create a new state with a deep copy of players and history.
-        new_state = NLHEState(
-            phase=self.phase,
-            players=[p.copy() for p in self.players],
-            board_cards=self.board_cards.copy(),
-            pot=self.pot,
-            history={k: v.copy() for k, v in self.history.items()},
-            bet_count=self.bet_count,
-            current_street=self.current_street,
-            next_player=self.next_player,
-            sb=self.sb,
-            bb=self.bb
-        )
-        cp = self.current_player()
-        if new_state.current_street is not None:
-            new_state.record_action(action)
-
-        if action == "FOLD":
-            new_state.phase = "TERMINAL"
-            return new_state
-
-        elif action == "PASSIVE_ACTION":
-            call_amount = 5 if new_state.history[new_state.current_street] and "CALL" in new_state.history[new_state.current_street][-1] else 0
-            new_state.players[cp]['stack'] -= call_amount
-            new_state.pot += call_amount
-
-        elif action in ["BET_20", "BET_100"]:
-            bet_size = new_state.pot if self.current_street == "PREFLOP" else (0.2 * new_state.pot if action == "BET_20" else new_state.pot)
-            new_state.players[cp]['stack'] -= bet_size
-            new_state.pot += bet_size
-            new_state.bet_count += 1
-
-        elif action == "ALL_IN":
-            all_in_amount = new_state.players[cp]['stack']
-            new_state.pot += all_in_amount
-            new_state.players[cp]['stack'] = 0
-            new_state.players[cp]['all_in'] = True
-
-        # If both players are all in, end the game.
-        if all(player['all_in'] for player in new_state.players):
-            new_state.phase = "TERMINAL"
-            return new_state
-
-        # Advance phase if enough actions have been taken.
-        total_actions = sum(len(v) for v in new_state.history.values())
-        if total_actions >= 2:
-            if self.current_street == "PREFLOP":
-                new_state.phase = "CHANCE_FLOP"
-                new_state.current_street = "FLOP"
-                deck = Deck()
-                new_state.board_cards = deck.draw_cards(3)
-                new_state.bet_count = 0
-            elif self.current_street == "FLOP":
-                new_state.phase = "CHANCE_TURN"
-                new_state.current_street = "TURN"
-                deck = Deck()
-                new_state.board_cards += deck.draw_cards(1)
-                new_state.bet_count = 0
-            elif self.current_street == "TURN":
-                new_state.phase = "CHANCE_RIVER"
-                new_state.current_street = "RIVER"
-                deck = Deck()
-                new_state.board_cards += deck.draw_cards(1)
-                new_state.bet_count = 0
-            elif self.current_street == "RIVER":
-                new_state.phase = "TERMINAL"
-
-        if new_state.current_player() is not None:
-            new_state.next_player = 1 - cp
-
-        return new_state
-
-    def information_set(self):
-        """
-        Returns the tokenized string representing all information available to the acting player.
-        The tokenization includes:
-          • General Info: BOS <HERO_POSITION> <HERO_CARD1> <HERO_CARD2> STACK_SIZE <stack digits> SB_SIZE <sb digits> BB_SIZE <bb digits>
-          • PREFLOP: the preflop action tokens (if any)
-          • FLOP: "FLOP POT_SIZE <pot> <3 board cards> <flop action tokens>"
-          • TURN: "TURN POT_SIZE <pot> <turn card> <turn action tokens>"
-          • RIVER: "RIVER POT_SIZE <pot> <river card> <river action tokens> EOS"
-        """
-        cp = self.current_player()
-        if cp is None:
-            return ""
-        pos = "BTN" if cp == 0 else "BB"
-        tokens = []
-        tokens.append("BOS")
-        tokens.append(pos)
-        # Get hero's cards from the players list.
-        hero_cards = self.players[cp]['cards']
-        for card in hero_cards:
-            tokens.append(f"RANK_{card.rank}")
-            tokens.append(card.suit)
-        eff_stack = str(int(self.players[cp]['stack']))
-        tokens.append("STACK_SIZE")
-        tokens.extend(list(eff_stack))
-        tokens.append("SB_SIZE")
-        tokens.extend(list(str(self.sb)))
-        tokens.append("BB_SIZE")
-        tokens.extend(list(str(self.bb)))
-
-        # PREFLOP section.
-        if self.history["PREFLOP"]:
-            tokens.append("PREFLOP")
-            tokens.extend(" ".join(self.history["PREFLOP"]).split())
-
-        # FLOP section.
-        if (self.current_street in ["FLOP", "TURN", "RIVER"]) or self.history["FLOP"]:
-            tokens.append("FLOP")
-            tokens.append("POT_SIZE")
-            tokens.extend(list(str(int(self.pot))))
-            if len(self.board_cards) >= 3:
-                for card in self.board_cards[:3]:
-                    tokens.append(f"RANK_{card.rank}")
-                    tokens.append(card.suit)
-            tokens.extend(" ".join(self.history["FLOP"]).split())
-
-        # TURN section.
-        if (self.current_street in ["TURN", "RIVER"]) or self.history["TURN"]:
-            if len(self.board_cards) >= 4:
-                tokens.append("TURN")
-                tokens.append("POT_SIZE")
-                tokens.extend(list(str(int(self.pot))))
-                card = self.board_cards[3]
-                tokens.append(f"RANK_{card.rank}")
-                tokens.append(card.suit)
-            tokens.extend(" ".join(self.history["TURN"]).split())
-
-        # RIVER section.
-        if self.current_street == "RIVER" or self.history["RIVER"]:
-            if len(self.board_cards) >= 5:
-                tokens.append("RIVER")
-                tokens.append("POT_SIZE")
-                tokens.extend(list(str(int(self.pot))))
-                card = self.board_cards[4]
-                tokens.append(f"RANK_{card.rank}")
-                tokens.append(card.suit)
-            tokens.extend(" ".join(self.history["RIVER"]).split())
-            tokens.append("EOS")
-        else:
-            tokens.append("EOS")
-
-        return " ".join(tokens)
-
-    def utility(self):
-        """
-        Computes terminal utilities based on:
-          - A fold action (the folder loses the pot)
-          - Both players all-in (using calculate_equity)
-          - Otherwise, showdown outcome via compare_hands.
-        """
-        for street in self.history:
-            for act in self.history[street]:
-                if "FOLD" in act:
-                    # Assume the player who folded loses.
-                    folded_player = 1 - self.next_player
-                    util = [0, 0]
-                    util[1 - folded_player] = self.pot
-                    util[folded_player] = -self.pot
-                    return tuple(util)
-
-        if all(player['all_in'] for player in self.players):
-            equity = calculate_equity(self.players[0]['cards'], self.players[1]['cards'], self.board_cards)
-            util0 = equity * self.pot
-            util1 = (1 - equity) * self.pot
-            return (util0, util1)
-
-        if len(self.board_cards) >= 3:
-            result = compare_hands(self.players[0]['cards'] + self.board_cards,
-                                   self.players[1]['cards'] + self.board_cards)
-            if result == "Player 0":
-                return (self.pot, -self.pot)
-            elif result == "Player 1":
-                return (-self.pot, self.pot)
-            else:
-                return (0, 0)
-        return (0, 0)
-
-
-# ---------------------------------------------------------------------
-# Deep MCCFR Training and Evaluation (Deep-Only)
-# ---------------------------------------------------------------------
-if __name__ == '__main__':
-    input_vocabulary = vocabulary
-    max_input_length = 40  # Adjust based on tokenized sequence length
-
-    # Create a deep solver root state, starting in the PREFLOP phase.
-    # The players list now holds each player's stack, cards, and all_in status.
-    deep_root = NLHEState(
-        phase="PREFLOP",
-        current_street="PREFLOP",
-        players=[{"stack": 100.0, "cards": [], "all_in": False}, {"stack": 100.0, "cards": [], "all_in": False}]
-    )
-    deep_solver = MonteCarloDeepCFRSolver(
-        root_state=deep_root,
-        input_vocabulary=input_vocabulary,
-        output_decisions=output_decisions,
-        max_input_length=max_input_length
-    )
-    try:
-        deep_solver.load("models")
-    except Exception as e:
-        print("No existing deep model found, starting fresh training")
-
-    # Set training parameters.
-    sessions = 1
-    iterations = 1
-    traversals_per_iter = 10
-    batch_size = 256
-    epochs = 10
-
-    for session in range(sessions):
-        print(f"\nTraining Session {session + 1}/{sessions}")
-        deep_solver.train(iterations, traversals_per_iter, batch_size, epochs)
-        deep_solver.save("models")
-        
-        # Evaluate strategy on sample information sets.
-        infosets = [
-            "RANK_A SUIT_1 RANK_K SUIT_2 PREFLOP",  # e.g., strong starting hands
-            "RANK_7 SUIT_1 RANK_2 SUIT_2 PREFLOP",  # e.g., weak starting hands
-            "RANK_Q SUIT_1 RANK_J SUIT_2 PREFLOP"
-        ]
-        print("\nStrategy Evaluation after Session {}:".format(session + 1))
-        for info_set in infosets:
-            legal = ["FOLD", "PASSIVE_ACTION", "BET_20"]
-            strategy = deep_solver.get_average_strategy(info_set, legal)
-            print(f"InfoSet: {info_set:<40} | Strategy: " +
-                  ", ".join(f"{a}={strategy.get(a, 0):.2f}" for a in legal))
+def create_info_set_for_hand(hand):
+    """Create information set string for a given hand."""
+    if hand[0] == hand[1]:  # Pair
+        info_set = f"BOS BTN RANK_{hand[0]} SUIT_1 RANK_{hand[0]} SUIT_2"
+    elif hand.endswith('s'):  # Suited
+        info_set = f"BOS BTN RANK_{hand[0]} SUIT_1 RANK_{hand[1]} SUIT_1"
+    else:  # Offsuit
+        info_set = f"BOS BTN RANK_{hand[0]} SUIT_1 RANK_{hand[1]} SUIT_2"
     
-    # --- Example: BTN Preflop Decision Grid ---
-    hand_grid = np.zeros((13, 13), dtype=int)
-    # For each hand, assign: 0 = Fold, 1 = Call/Check, 2 = Raise.
-    for i, r1 in enumerate(rank_order):
-        for j, r2 in enumerate(rank_order):
-            if i == j:
-                # For pairs, use two different suits.
-                hole_cards = [Card(f"RANK_{r1}", "SUIT_1"), Card(f"RANK_{r1}", "SUIT_2")]
-            elif i > j:
-                # Lower triangle: suited.
-                hole_cards = [Card(f"RANK_{r1}", "SUIT_1"), Card(f"RANK_{r2}", "SUIT_1")]
-            else:
-                # Upper triangle: offsuit.
-                hole_cards = [Card(f"RANK_{r1}", "SUIT_1"), Card(f"RANK_{r2}", "SUIT_2")]
+    return info_set + f" STACK_SIZE 200 SB_SIZE 1 BB_SIZE 2 PREFLOP BTN POST 1 BB POST 2 EOS"
 
-            state = NLHEState(
-                phase="PREFLOP",
-                players=[
-                    {"stack": 100.0, "cards": hole_cards, "all_in": False},
-                    {"stack": 100.0, "cards": [], "all_in": False}
-                ],
-                board_cards=[],
-                pot=1.5,
-                history={"PREFLOP": [], "FLOP": [], "TURN": [], "RIVER": []},
-                bet_count=0,
-                current_street="PREFLOP",
-                next_player=0,
-                sb=1,
-                bb=2
-            )
-            info_set = state.information_set()
-            legal = ["FOLD", "PASSIVE_ACTION", "BET_20"]
-            strat = deep_solver.get_average_strategy(info_set, legal)
-            best_action = max(legal, key=lambda a: strat.get(a, 0))
-            if best_action == "FOLD":
-                hand_grid[i, j] = 0
-            elif best_action == "PASSIVE_ACTION":
-                hand_grid[i, j] = 1
+def print_hand_state(state):
+    """Print the current state of the hand."""
+    def print_cards(cards):
+        return ', '.join(str(card.rank + card.suit[0].lower()) for card in cards)
+    
+    print(f"\nInitial stacks: BTN: {state.players[0]['stack']}, BB: {state.players[1]['stack']}")
+    print(f"BTN cards: {print_cards(sorted(state.players[0]['hole_cards'], key=lambda card: -rank_value[card.rank]))}")
+    print(f"BB cards: {print_cards(sorted(state.players[1]['hole_cards'], key=lambda card: -rank_value[card.rank]))}")
+    print("\nPREFLOP")
+
+def play_example_hand(deep_solver):
+    """Play and print an example hand."""
+    state = NLHEState()
+    print_hand_state(state)
+
+    while not state.is_terminal():
+        if state.is_chance():
+            state = state.next_state_from_chance()
+            if state.current_street != "PREFLOP":
+                print(f"\n{state.current_street}: {' '.join(str(card) for card in state.board)}")
+                print(f"Pot: {state.pot}")
+        else:
+            current_player = "BTN" if state.current_player() == 0 else "BB"
+            strategy = deep_solver.get_average_strategy(state.information_set(), state.legal_player_actions())
+            action = max(strategy.items(), key=lambda x: x[1])[0]
+            
+            # Display amount based on action type
+            if action == "CALL":
+                print(f"{current_player} {action} {state.current_bet}")
+            elif action.startswith("BET"):
+                bet_amount = int(0.2 * state.pot) if action == "BET_20" else state.pot
+                print(f"{current_player} {action} ({bet_amount})")
+            elif action == "ALL_IN":
+                all_in_amount = state.players[state.current_player()]["stack"]
+                print(f"{current_player} {action} ({all_in_amount})")
             else:
-                hand_grid[i, j] = 2
+                print(f"{current_player} {action}")
+                
+            state = state.next_state_from_action(action)
+
+    print("\nFinal outcome:")
+    utility = state.utility()
+    print(f"BTN profit: {utility[0]}")
+    print(f"BB profit: {utility[1]}")
+
+def generate_preflop_grid(deep_solver):
+    """Generate and plot the preflop raising frequency grid."""
+    grid = np.zeros((13, 13))
+    ranks = [f"RANK_{r}" for r in rank_order]
+    
+    for i, r1 in enumerate(ranks):
+        for j, r2 in enumerate(ranks[::-1]):
+            suit2 = "SUIT_1" if i < j else "SUIT_2"
+            info_set = f"BOS BTN {r1} SUIT_1 {r2} {suit2} STACK_SIZE 200 SB_SIZE {SB_AMOUNT} BB_SIZE {BB_AMOUNT} PREFLOP BTN POST {SB_AMOUNT} BB POST {BB_AMOUNT} BTN RAISE_100 EOS"
+            strategy = deep_solver.get_average_strategy(info_set, ["BET_100", "CALL", "FOLD"])
+            grid[i, j] = strategy.get("BET_100", 0)
 
     plt.figure(figsize=(8, 8))
-    cmap = plt.cm.get_cmap("RdYlGn", 3)
-    im = plt.imshow(hand_grid, cmap=cmap, origin='lower')
-    plt.xticks(np.arange(13), rank_order)
-    plt.yticks(np.arange(13), rank_order)
-    plt.xlabel("Second Card")
-    plt.ylabel("First Card")
-    plt.title("BTN Preflop Decision Grid\n0=Fold (Red), 1=Call/Check (Yellow), 2=Raise (Green)")
-    for i in range(13):
-        for j in range(13):
-            action_letter = {0: "F", 1: "C", 2: "R"}.get(hand_grid[i, j], "")
-            plt.text(j, i, action_letter, ha="center", va="center", color="black", fontsize=12)
-    plt.colorbar(im, ticks=[0, 1, 2])
-    plt.savefig("btn_decision_grid.png")
+    plt.imshow(grid, cmap='viridis', origin='lower', vmin=0, vmax=1)
+    plt.colorbar(label='Raise Frequency')
+    plt.xticks(ticks=range(13), labels=rank_order[::-1])
+    plt.yticks(ticks=range(13), labels=rank_order)
+    plt.title("BTN Raising Frequency Grid (Preflop)")
+    plt.xlabel("Card 2")
+    plt.ylabel("Card 1")
+    plt.tight_layout()
     plt.show()
 
-    print("\nTraining Statistics:")
-    print("Sessions:", sessions)
-    print("Iterations per session:", iterations)
-    print("Traversals per iteration:", traversals_per_iter)
-    print("Batch size:", batch_size)
-    print("Epochs per iteration:", epochs)
+if __name__ == '__main__':
+    # Initialize model
+    deep_solver = MonteCarloDeepCFRSolver(
+        root_state=NLHEState(),
+        input_vocabulary=input_vocabulary,
+        output_decisions=output_decisions,
+        max_input_length=50
+    )
+
+    # # Load existing model or start fresh
+    # try:
+    #     deep_solver.load("models/nlhe")
+    # except Exception:
+    #     print("No existing model found, starting fresh training")
+
+    # # Training loop
+    # sessions, iterations = 1, 5
+    # traversals_per_iter, batch_size, epochs = 1000, 256, 5
+    
+    # start_time = time.time()
+    # for session in range(sessions):
+    #     print(f"\nTraining Session {session + 1}/{sessions}")
+    #     session_start = time.time()
+        
+    #     deep_solver.train(iterations, traversals_per_iter, batch_size, epochs)
+    #     deep_solver.save("models/nlhe")
+        
+    #     session_time = time.time() - session_start
+    #     print(f"Session completed in {session_time:.1f} seconds")
+
+    #     # Evaluate test hands
+    #     test_hands = ["AA", "KK", "JTs", "55", "72o"]
+    #     print("\nEvaluating preflop strategies:")
+    #     for hand in test_hands:
+    #         info_set = create_info_set_for_hand(hand)
+    #         strategy = deep_solver.get_average_strategy(info_set, ["CALL", "FOLD", "BET_100"])
+    #         print(f"\nHand: {hand}")
+    #         print("Strategy:", {k: f"{v:.3f}" for k, v in strategy.items()})
+
+    # total_time = time.time() - start_time
+    # print(f"\nTotal training time: {total_time:.1f} seconds")
+    
+    # Run examples
+    print("\nPlaying example hand:")
+    play_example_hand(deep_solver)
+    generate_preflop_grid(deep_solver)

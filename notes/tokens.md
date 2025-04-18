@@ -48,7 +48,8 @@
 
 ## Outputs
 - `FOLD`
-- `PASSIVE_ACTION` (Check or Call)
+- `CHECK`
+- `CALL`
 - `BET_20` (Bet or Raise 20% of pot)
 - `BET_100`
 - `ALL_IN`
